@@ -1,6 +1,6 @@
 # UX Psychology Principles — and What They Mean for Developer Experience
 
-This note captures the behavioral-psychology principles behind why some
+This note captures the behavioural-psychology principles behind why some
 products (and some workflows) feel effortless while others feel like a
 chore. It exists as shared organisational knowledge — the same ideas that
 shape sticky consumer apps also explain why a PR template gets filled in
@@ -24,8 +24,8 @@ alongside each principle below, we reframe it as a **developer experience
 | **Investment** | Users who put effort in (profile, preferences) are more likely to return | A contributor who fills in a clear template, gets a fast first review response, and sees their PR merged cleanly is more likely to contribute again |
 | **Progress indicators / goal-gradient effect** | People push harder as they perceive themselves closer to a goal | PR templates with a checklist ("Test plan", "Screenshots", "Linked issue") show a contributor exactly how close they are to "done"; CI status checks are a real-time progress indicator |
 | **Loss aversion** | People work harder to avoid losing something than to gain the equivalent | A stale branch protection warning ("this PR is now out of date and needs a rebase") triggers action faster than a neutral status note |
-| **Social proof** | Seeing others' behaviour normalizes an action | CODEOWNERS, visible approvals, and CI badges in the org profile README (`profile/README.md`) signal "this is how we work here" |
-| **Personalization / investment** | Tailored experience increases perceived value | Auto-assigning the right reviewer/team via CODEOWNERS reduces the "who do I even ask" friction |
+| **Social proof** | Seeing others' behaviour normalizes an action | A CODEOWNERS file (once added) would let visible approvals, and CI badges in the org profile README (`profile/README.md`) signal "this is how we work here" |
+| **Personalization / investment** | Tailored experience increases perceived value | Using CODEOWNERS (once added) to auto-assign the right reviewer/team reduces the "who do I even ask" friction |
 | **Immediate feedback loops** | Instant confirmation of an action taken | Fast CI feedback, template validation, and bot comments confirming "your PR meets the checklist" close the loop quickly |
 | **Peak-End rule** | People judge an experience mostly by its most intense point and its ending | The merge experience (clean squash-merge message, thank-you note, closed-issue auto-link) is the "end" of a contribution — worth polishing even though it feels like a formality |
 | **Choice overload / Hick's Law** | More options = slower decisions | A single well-scoped issue template beats five overlapping ones; a PR template with 3–4 sections beats one with 15 |
@@ -63,5 +63,4 @@ exist (or are still marked "coming soon") in this repo:
   (e.g., a bot comment or required-check) that confirms the checklist was
   actually completed, rather than relying on reviewers to notice omissions.
 
-See the tracking issue linked from this doc's introducing PR for the
-concrete follow-up checklist.
+See tracking issue #2 for the concrete follow-up checklist.
