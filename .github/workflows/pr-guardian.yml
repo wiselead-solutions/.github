@@ -65,6 +65,16 @@ jobs:
             'Risk & Rollout',
             'Reviewer Guidance'
           )
+
+          function Test-GuardianVerdictChanged([int]$PrNumber, [string]$Verdict) {
+            $encodedBodies = gh api --paginate "repos/$repo/pulls/$PrNumber/reviews?per_page=100" `
+              --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("PR Guardian")) | .body | @base64' 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "Could not read prior Guardian reviews for PR #$PrNumber" }
+            $lastEncoded = @($encodedBodies | Where-Object { $_ } | Select-Object -Last 1)
+            if ($lastEncoded.Count -eq 0) { return $true }
+            $lastVerdict = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lastEncoded[0]))
+            return $lastVerdict -cne $Verdict
+          }
           # Exactly one space between keyword and target.
           $issueLink = '(?m)\b(Closes|Fixes|Resolves|Part of) ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#|#)\d+\b'
 
@@ -141,14 +151,19 @@ jobs:
               $comment = "**PR Guardian - blocked**`n`nThis PR is not ready to merge until the following are resolved:`n" `
                 + ($blockReasons -join "`n") `
                 + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
-              gh pr review $num --repo $repo --comment --body $comment
-              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              if (Test-GuardianVerdictChanged $num $comment) {
+                gh pr review $num --repo $repo --comment --body $comment
+                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
               gh pr edit $num --repo $repo --add-label 'guardian:blocked'
               if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$num" }
             } else {
               Write-Host "PR #$num PASSED"
-              gh pr review $num --repo $repo --comment --body "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
-              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              $comment = "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
+              if (Test-GuardianVerdictChanged $num $comment) {
+                gh pr review $num --repo $repo --comment --body $comment
+                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
               gh pr edit $num --repo $repo --remove-label 'guardian:blocked'
               if ($LASTEXITCODE -ne 0) { Write-Host "removing guardian:blocked from #$num was a no-op" }
 
