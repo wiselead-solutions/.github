@@ -1,0 +1,184 @@
+name: .github — PR Guardian
+
+# Hygiene gate for this repository, added because it had no PR gate of any
+# kind - no workflows directory at all. Modelled on the fixed, current
+# generation of this org's guardians (dev-hub, wiselead-marketing, tasker):
+# read CI state from statusCheckRollup rather than `gh pr checks` text
+# output (the runner's gh 2.46 has no --json support on that subcommand, and
+# text-parsing an empty/failed API response is indistinguishable from "no
+# checks" - which several guardians in this org have merged straight
+# through), post COMMENT reviews rather than approve/request-changes (the
+# default GITHUB_TOKEN cannot later approve to clear its own
+# CHANGES_REQUESTED), and merge directly with no `--auto` (auto-merge waits
+# on required status checks, and this repo configures none).
+#
+# ZERO CHECKS PASSES here, deliberately, unlike dev-hub/wiselead-marketing/
+# academy-programs which block on it: this repo has no CI workflow at all,
+# so a check list is not expected to ever be non-empty, and blocking on it
+# would leave every PR permanently unmergeable. If real CI is ever added
+# here, revisit this - see those repos' pr-guardian.yml for the blocking
+# version and why they chose it.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+  pull_request:
+    # labeled/unlabeled are excluded on purpose: this workflow writes the
+    # guardian:blocked label itself, which would re-trigger it forever.
+    types: [opened, edited, reopened, ready_for_review, synchronize, assigned, unassigned]
+
+permissions:
+  contents: write
+  issues: write        # gh label create
+  pull-requests: write
+  checks: read
+  actions: read
+
+concurrency:
+  group: pr-guardian-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Audit open PRs
+    runs-on: [self-hosted, linux]
+    steps:
+      - name: Audit all open PRs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_REPOSITORY
+
+          gh label create 'guardian:blocked' --repo $repo --color 'b60205' --description 'PR Guardian: not ready to merge' --force
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not ensure guardian:blocked exists" }
+          gh label create 'guardian:skip' --repo $repo --color 'ededed' --description 'PR Guardian: skip this PR entirely' --force
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not ensure guardian:skip exists" }
+
+          # The canonical org five. See AGENTS.md.
+          $requiredSections = @(
+            'Executive Summary',
+            'Technical Summary',
+            'Testing',
+            'Risk & Rollout',
+            'Reviewer Guidance'
+          )
+
+          function Test-GuardianVerdictChanged([int]$PrNumber, [string]$Verdict) {
+            $encodedBodies = gh api --paginate "repos/$repo/pulls/$PrNumber/reviews?per_page=100" `
+              --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("PR Guardian")) | .body | @base64' 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "Could not read prior Guardian reviews for PR #$PrNumber" }
+            $lastEncoded = @($encodedBodies | Where-Object { $_ } | Select-Object -Last 1)
+            if ($lastEncoded.Count -eq 0) { return $true }
+            $lastVerdict = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lastEncoded[0]))
+            return $lastVerdict -cne $Verdict
+          }
+          # Exactly one space between keyword and target.
+          $issueLink = '(?m)\b(Closes|Fixes|Resolves|Part of) ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#|#)\d+\b'
+
+          $prsJson = gh pr list --repo $repo --state open --limit 100 --json number,title,body,isDraft,assignees,labels,headRefName
+          if ($LASTEXITCODE -ne 0) { throw "gh pr list failed" }
+          $prs = @($prsJson | ConvertFrom-Json)
+          Write-Host "Auditing $($prs.Count) open PR(s) in $repo"
+
+          foreach ($pr in $prs) {
+            $num = $pr.number
+            $body = if ($pr.body) { $pr.body } else { '' }
+            $labels = @($pr.labels | ForEach-Object { $_.name })
+            Write-Host "--- PR #$num : $($pr.title)"
+
+            if ($labels -icontains 'guardian:skip') {
+              Write-Host "PR #$num skipped (guardian:skip)"
+              continue
+            }
+
+            $isDependabot = $pr.headRefName -like 'dependabot/*'
+            $blockReasons = @()
+
+            if ($pr.isDraft) { $blockReasons += '- PR is still a draft' }
+
+            if (-not $isDependabot) {
+              if ($pr.assignees.Count -eq 0) { $blockReasons += '- No assignee set' }
+              foreach ($section in $requiredSections) {
+                if ($body -notmatch [regex]::Escape($section)) {
+                  $blockReasons += "- Missing PR body section: $section"
+                }
+              }
+              if ($body -notmatch $issueLink) {
+                $blockReasons += '- No issue link. Use `Closes #N`, `Fixes #N`, `Resolves #N` or `Part of #N`.'
+              }
+            }
+
+            # CI state via statusCheckRollup, not `gh pr checks` text output -
+            # see header. Excludes this workflow's own in-flight check, or the
+            # guardian blocks on itself forever.
+            $rollupJson = gh pr view $num --repo $repo --json statusCheckRollup
+            $ciReadOk = ($LASTEXITCODE -eq 0)
+            $global:LASTEXITCODE = 0
+
+            $checks = @()
+            if ($ciReadOk) {
+              try {
+                $allChecks = @(($rollupJson | ConvertFrom-Json).statusCheckRollup)
+                $checks = @($allChecks | Where-Object { $_.workflowName -ne $env:GITHUB_WORKFLOW })
+              } catch { $ciReadOk = $false }
+            }
+
+            if (-not $ciReadOk) {
+              $blockReasons += '- Could not read CI status (treating as not green)'
+            } elseif ($checks.Count -gt 0) {
+              $failed = @()
+              $pending = @()
+              foreach ($check in $checks) {
+                $name = if ($check.name) { $check.name } else { $check.context }
+                if ($check.__typename -ceq 'CheckRun') {
+                  if ($check.status -ne 'COMPLETED') { $pending += $name; continue }
+                  if ($check.conclusion -notin @('SUCCESS', 'NEUTRAL', 'SKIPPED')) { $failed += $name }
+                } else {
+                  if ($check.state -eq 'PENDING') { $pending += $name; continue }
+                  if ($check.state -ne 'SUCCESS') { $failed += $name }
+                }
+              }
+              if ($failed.Count -gt 0) { $blockReasons += "- CI is failing: $($failed -join ', ')" }
+              if ($pending.Count -gt 0) { $blockReasons += "- CI is still running: $($pending -join ', ')" }
+            }
+            # $checks.Count -eq 0 deliberately passes here - see header.
+
+            if ($blockReasons.Count -gt 0) {
+              Write-Host "PR #$num BLOCKED"
+              $comment = "**PR Guardian - blocked**`n`nThis PR is not ready to merge until the following are resolved:`n" `
+                + ($blockReasons -join "`n") `
+                + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
+              if (Test-GuardianVerdictChanged $num $comment) {
+                gh pr review $num --repo $repo --comment --body $comment
+                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
+              gh pr edit $num --repo $repo --add-label 'guardian:blocked'
+              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$num" }
+            } else {
+              Write-Host "PR #$num PASSED"
+              $comment = "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
+              if (Test-GuardianVerdictChanged $num $comment) {
+                gh pr review $num --repo $repo --comment --body $comment
+                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
+              gh pr edit $num --repo $repo --remove-label 'guardian:blocked'
+              if ($LASTEXITCODE -ne 0) { Write-Host "removing guardian:blocked from #$num was a no-op" }
+
+              gh pr merge $num --repo $repo --squash --delete-branch
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "::warning::could not merge #$num - may be conflicting, already merged, or blocked by GitHub"
+              } else {
+                Write-Host "PR #$num merged"
+              }
+            }
+          }
+
+          Write-Host "Audit complete."
+
+          # THIS JOB ALWAYS SUCCEEDS, DELIBERATELY - see dev-hub's pr-guardian.yml
+          # for the full writeup of why a red audit check becomes a permanent
+          # self-inflicted block.
+          exit 0
