@@ -232,7 +232,10 @@ jobs:
               # hotfix/* into main. Into the default branch -> --merge; anything else
               # (feature/* into develop) -> --squash.
               $mergeMethod = if ($base -eq $defaultBranch) { '--merge' } else { '--squash' }
-              $mergeOut = gh pr merge $num --repo $repo $mergeMethod --delete-branch 2>&1
+              # Never delete a long-lived branch: with base-keyed merges a develop -> main PR
+              # would otherwise delete develop. Only feature-style heads are deleted (ai-org#207 W2).
+              $deleteArgs = @(if ("$($pr.headRefName)" -notmatch '^(develop|main)$|^(release|hotfix)/') { '--delete-branch' })
+              $mergeOut = gh pr merge $num --repo $repo $mergeMethod @deleteArgs 2>&1
               $mergeExit = $LASTEXITCODE
               if ($mergeExit -eq 0) {
                 Write-Host "PR #$num merged ($mergeMethod)"
