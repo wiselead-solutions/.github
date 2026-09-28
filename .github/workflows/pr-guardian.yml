@@ -78,7 +78,46 @@ jobs:
           # Exactly one space between keyword and target.
           $issueLink = '(?m)\b(Closes|Fixes|Resolves|Part of) ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#|#)\d+\b'
 
-          $prsJson = gh pr list --repo $repo --state open --limit 100 --json number,title,body,isDraft,assignees,labels,headRefName
+          # Read ONCE per run, before the loop (ai-org#207 W2). The default branch
+          # decides the merge method and the base-branch rule below.
+          $defaultBranch = gh repo view $repo --json defaultBranchRef --jq .defaultBranchRef.name
+          if ($LASTEXITCODE -ne 0 -or -not $defaultBranch) { throw "could not read the default branch of $repo" }
+
+          # Base-branch rule: in a repo with a develop branch, only develop, release/*
+          # and hotfix/* may target the default branch (ai-org docs/WAYS-OF-WORKING.md).
+          # A 404 means no develop, so the rule is off; any other failure is a guardian
+          # malfunction and throws like the gh pr list failure below.
+          $developOut = gh api "repos/$repo/branches/develop" 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            $hasDevelop = $true
+            Write-Host "Base-branch rule on: $repo has develop; only develop, release/* and hotfix/* may target $defaultBranch"
+          } elseif (($developOut | Out-String) -match 'HTTP 404') {
+            $hasDevelop = $false
+            Write-Host "Base-branch rule skipped: $repo has no develop branch"
+          } else {
+            throw "could not check whether $repo has a develop branch: $($developOut | Out-String)"
+          }
+          $global:LASTEXITCODE = 0
+
+          # Records a blocked verdict on ONE PR: a COMMENT review plus the
+          # guardian:blocked label. Shared by the audit and the merge call, so a PR
+          # found to conflict only at merge time is told so on its own thread in the
+          # same shape as any other block.
+          function Set-GuardianBlocked([int]$PrNumber, [string[]]$Reasons) {
+            $comment = "**PR Guardian - blocked**`n`nThis PR is not ready to merge until the following are resolved:`n" `
+              + ($Reasons -join "`n") `
+              + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
+            if (Test-GuardianVerdictChanged $PrNumber $comment) {
+              gh pr review $PrNumber --repo $repo --comment --body $comment
+              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$PrNumber" }
+            } else { Write-Host "PR #$PrNumber verdict unchanged; not posting a duplicate review" }
+            # REST, not `gh pr edit`: that queries the retired Projects Classic
+            # GraphQL field on the fleet's gh version and fails.
+            gh api --method POST "repos/$repo/issues/$PrNumber/labels" -f 'labels[]=guardian:blocked' | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$PrNumber" }
+          }
+
+          $prsJson = gh pr list --repo $repo --state open --limit 100 --json number,title,body,isDraft,assignees,labels,headRefName,baseRefName
           if ($LASTEXITCODE -ne 0) { throw "gh pr list failed" }
           $prs = @($prsJson | ConvertFrom-Json)
           Write-Host "Auditing $($prs.Count) open PR(s) in $repo"
@@ -146,17 +185,34 @@ jobs:
             }
             # $checks.Count -eq 0 deliberately passes here - see header.
 
+            # Mergeability per PR, read separately so a failed read only costs this
+            # PR its conflict check. GitHub computes it lazily: UNKNOWN means "not
+            # computed yet" and must never read as a conflict.
+            $base = $pr.baseRefName
+            $mergeable = 'UNKNOWN'
+            $mergeableOut = gh pr view $num --repo $repo --json mergeable --jq .mergeable 2>&1
+            if ($LASTEXITCODE -eq 0 -and $mergeableOut) {
+              $mergeable = ($mergeableOut | Out-String).Trim()
+            } else {
+              Write-Host "PR #${num}: could not read mergeable state, auditing without it"
+              Write-Host ($mergeableOut | Out-String)
+            }
+            $global:LASTEXITCODE = 0
+            Write-Host "PR #$num mergeable = $mergeable (base $base)"
+
+            # Same text wherever a conflict is detected, so the verdict does not flap.
+            $conflictReason = "- Branch conflicts with $base and cannot be merged (rebase onto $base, or merge it in, and push)"
+            if ($mergeable -eq 'CONFLICTING') { $blockReasons += $conflictReason }
+
+            $headRef = $pr.headRefName
+            if ($hasDevelop -and $base -eq $defaultBranch -and
+                -not ($headRef -eq 'develop' -or $headRef -like 'release/*' -or $headRef -like 'hotfix/*')) {
+              $blockReasons += "- Base branch is $defaultBranch but head is ${headRef}: only develop, release/* and hotfix/* may target $defaultBranch (retarget this PR to develop)"
+            }
+
             if ($blockReasons.Count -gt 0) {
               Write-Host "PR #$num BLOCKED"
-              $comment = "**PR Guardian - blocked**`n`nThis PR is not ready to merge until the following are resolved:`n" `
-                + ($blockReasons -join "`n") `
-                + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
-              if (Test-GuardianVerdictChanged $num $comment) {
-                gh pr review $num --repo $repo --comment --body $comment
-                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
-              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
-              gh pr edit $num --repo $repo --add-label 'guardian:blocked'
-              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$num" }
+              Set-GuardianBlocked $num $blockReasons
             } else {
               Write-Host "PR #$num PASSED"
               $comment = "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
@@ -164,14 +220,35 @@ jobs:
                 gh pr review $num --repo $repo --comment --body $comment
                 if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
               } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
-              gh pr edit $num --repo $repo --remove-label 'guardian:blocked'
-              if ($LASTEXITCODE -ne 0) { Write-Host "removing guardian:blocked from #$num was a no-op" }
-
-              gh pr merge $num --repo $repo --squash --delete-branch
+              # REST, not `gh pr edit` - see Set-GuardianBlocked. 404 = label not on the PR.
+              $unlabelOut = gh api --method DELETE "repos/$repo/issues/$num/labels/guardian%3Ablocked" 2>&1
               if ($LASTEXITCODE -ne 0) {
-                Write-Host "::warning::could not merge #$num - may be conflicting, already merged, or blocked by GitHub"
+                if (($unlabelOut | Out-String) -match 'HTTP 404') { Write-Host "removing guardian:blocked from #$num was a no-op" }
+                else { Write-Host "::warning::could not clear guardian:blocked on #$num" }
+              }
+
+              # Merge method keys off the BASE branch. Decided 2026-09-24 (ai-org
+              # docs/WAYS-OF-WORKING.md): base-keyed; head-keying squashed release/* and
+              # hotfix/* into main. Into the default branch -> --merge; anything else
+              # (feature/* into develop) -> --squash.
+              $mergeMethod = if ($base -eq $defaultBranch) { '--merge' } else { '--squash' }
+              # Never delete a long-lived branch: with base-keyed merges a develop -> main PR
+              # would otherwise delete develop. Only feature-style heads are deleted (ai-org#207 W2).
+              $deleteArgs = @(if ("$($pr.headRefName)" -notmatch '^(develop|main)$|^(release|hotfix)/') { '--delete-branch' })
+              $mergeOut = gh pr merge $num --repo $repo $mergeMethod @deleteArgs 2>&1
+              $mergeExit = $LASTEXITCODE
+              if ($mergeExit -eq 0) {
+                Write-Host "PR #$num merged ($mergeMethod)"
+              } elseif (($mergeOut | Out-String) -match 'not mergeable|merge commit cannot be cleanly created|[Mm]erge conflict') {
+                # A conflict is the PR's own state, not a guardian fault: record the
+                # blocked verdict on that PR (covers a conflict that appeared after the
+                # mergeable read above, or an UNKNOWN read) and carry on.
+                Write-Host "PR #$num conflicts with $base - recording it on the PR"
+                Write-Host ($mergeOut | Out-String)
+                Set-GuardianBlocked $num @($conflictReason)
               } else {
-                Write-Host "PR #$num merged"
+                Write-Host "::warning::could not merge #$num (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
+                Write-Host ($mergeOut | Out-String)
               }
             }
           }
