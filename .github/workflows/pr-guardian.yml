@@ -26,7 +26,13 @@ on:
   pull_request:
     # labeled/unlabeled are excluded on purpose: this workflow writes the
     # guardian:blocked label itself, which would re-trigger it forever.
-    types: [opened, edited, reopened, ready_for_review, synchronize, assigned, unassigned]
+    # Every change to the PR re-audits it (owner, 2026-10-04): commits, title/body edits,
+    # draft state, assignees, review requests. Deliberately NOT labeled/unlabeled: the
+    # guard writes `guardian:blocked` itself, which would re-trigger it forever.
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft, assigned, unassigned, review_requested, review_request_removed]
+  # A review submitted or dismissed changes what the guard sees too.
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: write
