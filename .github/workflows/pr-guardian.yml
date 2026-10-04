@@ -12,21 +12,29 @@ name: .github — PR Guardian
 # CHANGES_REQUESTED), and merge directly with no `--auto` (auto-merge waits
 # on required status checks, and this repo configures none).
 #
-# ZERO CHECKS PASSES here, deliberately, unlike dev-hub/wiselead-marketing/
-# academy-programs which block on it: this repo has no CI workflow at all,
-# so a check list is not expected to ever be non-empty, and blocking on it
-# would leave every PR permanently unmergeable. If real CI is ever added
-# here, revisit this - see those repos' pr-guardian.yml for the blocking
-# version and why they chose it.
+# ZERO CHECKS passes ONLY while no other workflow in this repo runs on pull
+# requests (owner, 2026-10-04). This repo had no CI workflow at all, so an
+# empty check list was the steady state and blocking on it would leave every
+# PR permanently unmergeable. The guard now reads the repo's active workflows
+# once per sweep: the moment one of them runs on pull_request, an empty list
+# means "CI has not reported yet" and blocks, like dev-hub/wiselead-marketing/
+# academy-programs. An unreadable workflow list counts as "CI expected". When
+# CI is added here, also list it under `on.workflow_run.workflows` so its
+# completion re-runs this guard.
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '*/15 * * * *'
   pull_request:
-    # labeled/unlabeled are excluded on purpose: this workflow writes the
-    # guardian:blocked label itself, which would re-trigger it forever.
-    types: [opened, edited, reopened, ready_for_review, synchronize, assigned, unassigned]
+    # Every change to the PR re-audits it (owner, 2026-10-04): commits, title/body edits,
+    # draft state, assignees, review requests, and the `guardian:skip` label. labeled/unlabeled
+    # are listened to only for `guardian:skip`: the job's `if:` drops every other label event,
+    # because the guard writes its own labels (`guardian:blocked` and others).
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft, assigned, unassigned, review_requested, review_request_removed, labeled, unlabeled]
+  # A review submitted or dismissed changes what the guard sees too.
+  pull_request_review:
+    types: [submitted, dismissed]
 
 permissions:
   contents: write
@@ -35,13 +43,31 @@ permissions:
   checks: read
   actions: read
 
-concurrency:
-  group: pr-guardian-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   guard:
     name: Audit open PRs
+    # Self-loop guards (owner, 2026-10-04). A review by a bot (Copilot's review, or the
+    # guardian's own `gh pr review` verdict should it ever run under a token that triggers
+    # workflows) must not fan out another sweep. `labeled`/`unlabeled` are triggers only so
+    # that adding or removing `guardian:skip` re-audits at once; any other label event is
+    # dropped here, because the guard writes its own labels (`guardian:blocked` and others).
+    if: >-
+      (github.event_name != 'pull_request_review' || github.event.review.user.type != 'Bot')
+      && (github.event_name != 'pull_request'
+      || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'guardian:skip')
+    # ONE repository-wide group (owner, 2026-10-04). Every run sweeps EVERY open PR, so a
+    # per-PR or per-branch key let events on two different PRs start two overlapping sweeps
+    # that raced on the same reviews, labels and merges. With one group and no
+    # cancel-in-progress, GitHub keeps the sweep already running plus ONE pending run and
+    # drops superseded pending ones; each run re-reads the whole open-PR set, so a dropped
+    # one cannot skip a PR. A dropped `pull_request` run shows as a cancelled check on its PR;
+    # the CI gate below excludes every run of this workflow, so it never blocks the PR.
+    # Job-level rather than workflow-level so a run the `if:` above skips never enters the
+    # group and never displaces a real pending sweep.
+    concurrency:
+      group: pr-guardian-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: [self-hosted, linux]
     steps:
       - name: Audit all open PRs
@@ -117,6 +143,30 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$PrNumber" }
           }
 
+          # Does any OTHER active workflow in this repo run on pull requests? Read once per
+          # sweep (see header). Anything unreadable counts as "CI expected", which blocks an
+          # empty check list rather than merging through it.
+          $prCiExpected = $false
+          try {
+            $wfPaths = @(gh api "repos/$repo/actions/workflows?per_page=100" --jq '.workflows[] | select(.state == "active") | .path')
+            if ($LASTEXITCODE -ne 0) { throw 'could not list workflows' }
+            foreach ($p in $wfPaths) {
+              if (-not $p -or $p -notmatch '^\.github/workflows/' -or $p -match '/pr-guardian\.ya?ml$') { continue }
+              $src = (gh api "repos/$repo/contents/$p" -H 'Accept: application/vnd.github.raw' 2>&1 | Out-String)
+              if ($LASTEXITCODE -ne 0) {
+                # A workflow whose file was deleted stays registered as `active`; skip it.
+                if ($src -match 'HTTP 404') { continue }
+                throw "could not read $p"
+              }
+              if ($src -match '(?m)^[^#\n]*\bpull_request(_target)?\b') { $prCiExpected = $true }
+            }
+          } catch {
+            Write-Host "::warning::$_ - treating PR CI as expected (an empty check list blocks)"
+            $prCiExpected = $true
+          }
+          $global:LASTEXITCODE = 0
+          Write-Host "PR CI expected in ${repo}: $prCiExpected"
+
           $prsJson = gh pr list --repo $repo --state open --limit 100 --json number,title,body,isDraft,assignees,labels,headRefName,baseRefName
           if ($LASTEXITCODE -ne 0) { throw "gh pr list failed" }
           $prs = @($prsJson | ConvertFrom-Json)
@@ -151,8 +201,11 @@ jobs:
             }
 
             # CI state via statusCheckRollup, not `gh pr checks` text output -
-            # see header. Excludes this workflow's own in-flight check, or the
-            # guardian blocks on itself forever.
+            # see header. Fails closed (owner, 2026-10-04): only checks that have
+            # COMPLETED as success/neutral/skipped pass; anything queued, in
+            # progress, pending, failed or unreadable blocks. Excludes every run of
+            # this workflow (by workflow name), or the guardian blocks on itself
+            # forever.
             $rollupJson = gh pr view $num --repo $repo --json statusCheckRollup
             $ciReadOk = ($LASTEXITCODE -eq 0)
             $global:LASTEXITCODE = 0
@@ -182,8 +235,10 @@ jobs:
               }
               if ($failed.Count -gt 0) { $blockReasons += "- CI is failing: $($failed -join ', ')" }
               if ($pending.Count -gt 0) { $blockReasons += "- CI is still running: $($pending -join ', ')" }
+            } elseif ($prCiExpected) {
+              $blockReasons += '- No CI checks have reported yet'
             }
-            # $checks.Count -eq 0 deliberately passes here - see header.
+            # $checks.Count -eq 0 passes only while no PR workflow exists - see header.
 
             # Mergeability per PR, read separately so a failed read only costs this
             # PR its conflict check. GitHub computes it lazily: UNKNOWN means "not
