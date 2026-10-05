@@ -1,0 +1,40 @@
+name: .github — Codex Autofix
+
+# Asks ChatGPT Codex to fix this repo's PRs with an "@codex fix ..." comment, via the org
+# reusable workflow wiselead-solutions/.github/workflows/codex-autofix.yml (read its header for
+# the full contract and every guard). Owner decision 2026-10-04: Codex replaces Copilot review
+# (wiselead-solutions#172).
+#
+#   - Codex review with a P0/P1 inline finding on the PR head -> "@codex fix the P0/P1 issues".
+#   - Same-repo branches only; main, release/* and bot/* skipped; one request per head SHA; at
+#     most 3 per PR; Codex answering without pushing labels the PR `codex-autofix-stalled`.
+#   - Label a PR `no-codex-autofix` to opt it out.
+#
+# Review path only: this repo has no PR CI (its only other workflow is pr-guardian.yml, which
+# has no workflow_run list), so there is no workflow_run: block. Add one listing the PR CI
+# workflow by its exact `name:` if PR CI is ever added here.
+#
+# This is NOT a pull_request workflow. The pull_request_review run does attach a check to the
+# PR; it finishes in seconds and never fails, and PRs stay draft until merge-ready, so the
+# guardian's decisive run comes later. No literal `runs-on` here: the reusable workflow picks
+# its runner.
+#
+# No concurrency: group. GitHub cancels superseded pending runs in a group, and a cancelled
+# pull_request_review run is a cancelled check on the PR, which the guardian blocks on.
+
+"on":
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+jobs:
+  codex-autofix:
+    name: Codex Autofix
+    uses: wiselead-solutions/wiselead-solutions/.github/workflows/codex-autofix.yml@main
+    secrets:
+      codex-trigger-token: ${{ secrets.CODEX_TRIGGER_TOKEN }}
