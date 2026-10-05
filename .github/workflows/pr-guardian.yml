@@ -206,7 +206,7 @@ jobs:
             # progress, pending, failed or unreadable blocks. Excludes every run of
             # this workflow (by workflow name), or the guardian blocks on itself
             # forever.
-            $rollupJson = gh pr view $num --repo $repo --json statusCheckRollup,headRefOid
+            $rollupJson = gh pr view $num --repo $repo --json 'statusCheckRollup,headRefOid'
             # The commit this CI verdict belongs to, read in the SAME call: the merge is bound to it.
             $auditedHead = ''
             if ($LASTEXITCODE -eq 0 -and $rollupJson) { try { $auditedHead = "$(($rollupJson | ConvertFrom-Json).headRefOid)" } catch { $auditedHead = '' } }
@@ -299,7 +299,7 @@ jobs:
               # draft, guardian:skip) right before merging, and bind the merge to the audited commit
               # with --match-head-commit so GitHub itself refuses it if the head moves after this
               # read. A skipped merge is never a failure: the next run re-audits the PR from scratch.
-              $nowJson = gh pr view $num --repo $repo --json headRefOid,isDraft,state,labels 2>$null
+              $nowJson = gh pr view $num --repo $repo --json 'headRefOid,isDraft,state,labels' 2>$null
               $nowOk = ($LASTEXITCODE -eq 0)
               $global:LASTEXITCODE = 0
               $now = $null
