@@ -206,7 +206,10 @@ jobs:
             # progress, pending, failed or unreadable blocks. Excludes every run of
             # this workflow (by workflow name), or the guardian blocks on itself
             # forever.
-            $rollupJson = gh pr view $num --repo $repo --json statusCheckRollup
+            $rollupJson = gh pr view $num --repo $repo --json statusCheckRollup,headRefOid
+            # The commit this CI verdict belongs to, read in the SAME call: the merge is bound to it.
+            $auditedHead = ''
+            if ($LASTEXITCODE -eq 0 -and $rollupJson) { try { $auditedHead = "$(($rollupJson | ConvertFrom-Json).headRefOid)" } catch { $auditedHead = '' } }
             $ciReadOk = ($LASTEXITCODE -eq 0)
             $global:LASTEXITCODE = 0
 
@@ -290,7 +293,27 @@ jobs:
               # Never delete a long-lived branch: with base-keyed merges a develop -> main PR
               # would otherwise delete develop. Only feature-style heads are deleted (ai-org#207 W2).
               $deleteArgs = @(if ("$($pr.headRefName)" -notmatch '^(develop|main)$|^(release|hotfix)/') { '--delete-branch' })
-              $mergeOut = gh pr merge $num --repo $repo $mergeMethod @deleteArgs 2>&1
+              # HEAD-BOUND MERGE (2026-10-05). The audit read the PR list, then CI, then
+              # mergeability; a push, a draft flip or a guardian:skip label added meanwhile would
+              # otherwise only be seen by the NEXT run. Re-read those gates (head commit, state,
+              # draft, guardian:skip) right before merging, and bind the merge to the audited commit
+              # with --match-head-commit so GitHub itself refuses it if the head moves after this
+              # read. A skipped merge is never a failure: the next run re-audits the PR from scratch.
+              $nowJson = gh pr view $num --repo $repo --json headRefOid,isDraft,state,labels 2>$null
+              $nowOk = ($LASTEXITCODE -eq 0)
+              $global:LASTEXITCODE = 0
+              $now = $null
+              if ($nowOk -and $nowJson) { try { $now = $nowJson | ConvertFrom-Json } catch { $now = $null } }
+              if (-not $auditedHead -or -not $now) {
+                Write-Host "PR #$num not merged: could not read its audited head or re-read it before merging; the next run re-audits it"
+                continue
+              }
+              $nowSkip = @($now.labels | ForEach-Object { $_.name }) -icontains 'guardian:skip'
+              if ($now.state -cne 'OPEN' -or $now.isDraft -or "$($now.headRefOid)" -cne $auditedHead -or $nowSkip) {
+                Write-Host "PR #$num not merged: it changed during this audit (head $auditedHead -> $($now.headRefOid), state $($now.state), draft $($now.isDraft), guardian:skip $nowSkip); the next run re-audits it"
+                continue
+              }
+              $mergeOut = gh pr merge $num --repo $repo $mergeMethod @deleteArgs --match-head-commit $auditedHead 2>&1
               $mergeExit = $LASTEXITCODE
               if ($mergeExit -eq 0) {
                 Write-Host "PR #$num merged ($mergeMethod)"
