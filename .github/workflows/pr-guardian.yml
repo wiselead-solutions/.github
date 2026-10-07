@@ -1,4 +1,4 @@
-name: .github — PR Guardian
+name: .github - PR Guardian
 
 # Hygiene gate for this repository, added because it had no PR gate of any
 # kind - no workflows directory at all. Modelled on the fixed, current
