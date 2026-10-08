@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "areas": {
+    "prd": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    },
+    "trd": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    },
+    "app_flow": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    },
+    "design_brief": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    },
+    "backend_schema": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    },
+    "implementation_plan": {
+      "status": "pending",
+      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+    }
+  }
+}
