@@ -3,6 +3,8 @@
 // This source is embedded in the trusted guardian workflow. PR files are data only.
 const { execFileSync } = require('node:child_process');
 const crypto = require('node:crypto');
+const process = require('node:process');
+const { Buffer } = require('node:buffer');
 const { isAbsolute } = require('node:path');
 const AREAS = ['prd', 'trd', 'app_flow', 'design_brief', 'backend_schema', 'implementation_plan'];
 const MANIFEST = '.github/documentation-baseline.json';

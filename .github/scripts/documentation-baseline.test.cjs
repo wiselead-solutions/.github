@@ -1,6 +1,8 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const process = require('node:process');
+const { Buffer } = require('node:buffer');
 const { AREAS, validate, audit, documentationOnly } = require('./documentation-baseline.cjs');
 const text = '# Canonical specification\n\n' + 'Verified requirements and acceptance criteria. '.repeat(5);
 const issue = 'https://github.com/wiselead-solutions/project-assets/issues/29';
@@ -95,6 +97,7 @@ test('truncated file inventories, unreadable API, draft and skip states cannot p
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const scriptDirectory = path.dirname(module.filename);
 const {spawnSync} = require('node:child_process');
 function cli(manifest, extraArgs=[]) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'documentation-gate-'));
@@ -113,7 +116,7 @@ else if(args[0]==='api' && args[1].includes('/files?')) console.log(JSON.stringi
 else if(args[0]==='api' && args[1].includes('/contents/')) console.log(JSON.stringify({type:'file',encoding:'base64',content:Buffer.from(args[1].includes('documentation-baseline.json')?JSON.stringify(cfg.manifest):'Verified canonical specification. '.repeat(10)).toString('base64')}));
 else console.log('done');
 `,{mode:0o755});
-  const result=spawnSync(process.execPath,[path.join(__dirname,'documentation-baseline.cjs'),'--merge','wiselead-solutions/example','1','--squash',...extraArgs],{
+  const result=spawnSync(process.execPath,[path.join(scriptDirectory,'documentation-baseline.cjs'),'--merge','wiselead-solutions/example','1','--squash',...extraArgs],{
     encoding:'utf8',env:{...process.env,DOCUMENTATION_GH_PATH:gh,PATH:dir+path.delimiter+process.env.PATH},
   });
   const calls=fs.readFileSync(log,'utf8').trim().split('\n').map(JSON.parse);
