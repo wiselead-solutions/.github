@@ -217,7 +217,7 @@ jobs:
             if ($ciReadOk) {
               try {
                 $allChecks = @(($rollupJson | ConvertFrom-Json).statusCheckRollup)
-                $checks = @($allChecks | Where-Object { $_.workflowName -ne $env:GITHUB_WORKFLOW })
+                $checks = @($allChecks | Where-Object { ([string]$_.workflowName).Replace([string][char]0x2014, '-') -ne $env:GITHUB_WORKFLOW.Replace([string][char]0x2014, '-') })
               } catch { $ciReadOk = $false }
             }
 
