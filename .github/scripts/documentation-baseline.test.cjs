@@ -52,6 +52,16 @@ test('only the precise enforcement assets bypass pending bootstrap; neighbouring
   assert.equal(run(pending(),[{filename:'.github/scripts/documentation-baseline.cjs'},{filename:'.github/workflows/pr-guardian.yml'}],'').ok,true);
   assert.equal(run(pending(),[{filename:'.github/scripts/other.cjs'}],'').ok,false);
 });
+test('bootstrap regression exemptions are scoped to their owning repository and exact file', () => {
+  for (const [repository, filename] of [
+    ['wiselead-solutions/ai-org', 'tools/test_validate.py'],
+    ['wiselead-solutions/rejist', '.github/tools/test_deploy_routing.py'],
+  ]) {
+    assert.equal(documentationOnly([{filename}], repository), true);
+    assert.equal(documentationOnly([{filename}], 'wiselead-solutions/other'), false);
+    assert.equal(documentationOnly([{filename: filename + '.extra'}], repository), false);
+  }
+});
 function fixture(overrides={}) {
   const head='a'.repeat(40);
   const pr={state:'open',draft:false,head:{sha:head},base:{sha:'b'.repeat(40)},body:body('unchanged'),labels:[],changed_files:1};
@@ -104,7 +114,7 @@ else if(args[0]==='api' && args[1].includes('/contents/')) console.log(JSON.stri
 else console.log('done');
 `,{mode:0o755});
   const result=spawnSync(process.execPath,[path.join(__dirname,'documentation-baseline.cjs'),'--merge','wiselead-solutions/example','1','--squash',...extraArgs],{
-    encoding:'utf8',env:{...process.env,PATH:dir+path.delimiter+process.env.PATH},
+    encoding:'utf8',env:{...process.env,DOCUMENTATION_GH_PATH:gh,PATH:dir+path.delimiter+process.env.PATH},
   });
   const calls=fs.readFileSync(log,'utf8').trim().split('\n').map(JSON.parse);
   fs.rmSync(dir,{recursive:true,force:true});
