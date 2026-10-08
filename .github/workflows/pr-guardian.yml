@@ -317,9 +317,11 @@ jobs:
           '@
           [System.IO.File]::WriteAllText($documentationValidatorPath, $documentationValidatorSource + "`n", [System.Text.UTF8Encoding]::new($false))
           "DOCUMENTATION_VALIDATOR_PATH=$documentationValidatorPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "DOCUMENTATION_GH_PATH=$((Get-Command gh -CommandType Application -ErrorAction Stop).Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $documentationGh = Get-Command gh -CommandType Application -ErrorAction Stop | Select-Object -First 1
+          "DOCUMENTATION_GH_PATH=$($documentationGh.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           if ($env:GITHUB_REPOSITORY -eq 'wiselead-solutions/shakad') {
-            "DOCUMENTATION_BASH_PATH=$((Get-Command bash -CommandType Application -ErrorAction Stop).Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            $documentationBash = Get-Command bash -CommandType Application -ErrorAction Stop | Select-Object -First 1
+            "DOCUMENTATION_BASH_PATH=$($documentationBash.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
 
       - name: Audit all open PRs
