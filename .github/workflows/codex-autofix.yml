@@ -1,4 +1,4 @@
-name: .github — Codex Autofix
+name: .github - Codex Autofix
 
 # Asks ChatGPT Codex to fix this repo's PRs with an "@codex fix ..." comment, via the org
 # reusable workflow wiselead-solutions/.github/workflows/codex-autofix.yml (read its header for
