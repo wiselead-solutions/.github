@@ -33,3 +33,14 @@ comment-only changes.
 
 **Don't duplicate CI.** There is no PR CI here; the guardian checks the PR body, assignee and
 draft state. Don't comment on formatting, Markdown style or naming.
+
+## Documentation baseline enforcement
+
+Before implementation, read [the documentation baseline](docs/documentation-baseline.md)
+and `.github/documentation-baseline.json`. Complete every pending area through the linked
+adoption issue; reuse canonical documents, record honest coverage and justified exclusions.
+Implementation PRs need all six documentation-impact rows under Technical Summary.
+Keep the five standard PR headings. The guardian blocks missing/pending/unreadable evidence;
+documentation-only completion can proceed. Do not certify unrelated README content as a spec.
+Run `node .github/scripts/documentation-baseline.test.cjs` when changing this gate and keep
+the trusted validator embedded in the guardian byte-for-byte aligned with its script copy.
