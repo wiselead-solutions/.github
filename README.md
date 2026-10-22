@@ -44,3 +44,7 @@ Welcome, team! This repository holds organisation-wide GitHub defaults (issue te
 | Engineering Lead | _update with GitHub @username_ |
 | DevOps | _update with GitHub @username or team_ |
 | HR / People | _update with GitHub @username or team_ |
+
+## Ways of working
+
+See [docs/WAYS-OF-WORKING.md](docs/WAYS-OF-WORKING.md) for environments, branching, the release train, code review and production approval.
