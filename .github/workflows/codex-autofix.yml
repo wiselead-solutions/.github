@@ -9,9 +9,13 @@ name: .github - Codex Autofix
 #   - Same-repo branches only; main, release/* and bot/* skipped; one request per head SHA; at
 #     most 3 per PR; Codex answering without pushing labels the PR `codex-autofix-stalled`.
 #   - Label a PR `no-codex-autofix` to opt it out.
+#   - The PR guardian leaves a PR `guardian:blocked` -> "@codex fix this PR so the PR Guardian
+#     passes:" listing the unresolved Codex threads, failed runs and merge conflict on its head
+#     (guardian path, wiselead-solutions#200). Nothing this workflow writes re-triggers the
+#     guardian, and the 3-request cap per PR bounds the loop.
 #
-# Review path only: this repo has no PR CI (its only other workflow is pr-guardian.yml, which
-# has no workflow_run list), so there is no workflow_run: block. Add one listing the PR CI
+# No PR CI to list: this repo has no PR CI (its only other workflow is pr-guardian.yml, which
+# has no workflow_run list), so workflow_run lists only the PR guardian (guardian path). Add the PR CI
 # workflow by its exact `name:` if PR CI is ever added here.
 #
 # This is NOT a pull_request workflow. The pull_request_review run does attach a check to the
@@ -25,6 +29,11 @@ name: .github - Codex Autofix
 "on":
   pull_request_review:
     types: [submitted]
+  workflow_run:
+    workflows:
+      # Guardian path (wiselead-solutions#200): a blocked PR gets Codex sent at what it can fix.
+      - ".github - PR Guardian"
+    types: [completed]
 
 permissions:
   contents: read
