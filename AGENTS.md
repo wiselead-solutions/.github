@@ -3,14 +3,12 @@
 The organisation-wide defaults repository for `wiselead-solutions`: the default PR template
 (`.github/pull_request_template.md`), the org profile (`profile/README.md`), the staff hub
 `README.md`, and a copy of the org ways of working (`docs/WAYS-OF-WORKING.md`). It ships no code
-and deploys nothing. Its only workflows are `pr-guardian.yml` and `codex-autofix.yml`; there is
+and deploys nothing. Its only workflow is `pr-guardian.yml`; there is
 no PR CI.
 
 ## Code Review Rules
 
-PRs are reviewed automatically by ChatGPT Codex (Copilot review was retired 2026-10-04,
-wiselead-solutions#172). A P0/P1 finding is sent straight back to Codex with `@codex fix` by
-`codex-autofix.yml`, so keep P0/P1 for defects that would hurt, and say nothing rather than
+PRs are reviewed automatically by Claude (the ai-org review loop; Copilot review was retired 2026-10-04 and ChatGPT Codex review 2026-10-27). Keep P0/P1 for defects that would hurt, and say nothing rather than
 guess.
 
 **Consequential here — flag at P0/P1:**

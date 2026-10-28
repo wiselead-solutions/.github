@@ -76,7 +76,7 @@ Code review is automated. A PR merges automatically when all required checks pas
 | Quality gate | SonarCloud | Yes |
 | Security | CodeQL, secret scanning, Dependabot | Yes (high/critical) |
 | IaC scanning | PSRule for Azure / Checkov | Yes (high/critical) |
-| AI review | ChatGPT Codex review (automatic) + `@codex fix` autofix (`codex-autofix.yml`) | High-severity (P0/P1) findings only |
+| AI review | Claude review (automatic, ai-org `unreviewed_prs` probe) | High-severity (P0/P1) findings only |
 
 **Human review is still required** (via `CODEOWNERS`) for changes to:
 - `.github/` (workflows, rulesets, CODEOWNERS itself)
