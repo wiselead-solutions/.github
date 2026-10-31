@@ -6,12 +6,23 @@
       "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no prd specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "trd": {
-      "status": "not_applicable",
-      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no trd specification to maintain; its workflows are covered by the org reusable-workflow standards."
+      "status": "ready",
+      "documents": [
+        "docs/WAYS-OF-WORKING.md",
+        "docs/documentation-baseline.md",
+        "README.md"
+      ],
+      "owner": "tech-lead",
+      "coverage": "Describes how this repository fits the org workflow: shared PR template, guardian and reusable-workflow standards, release train and documentation-baseline rules that its workflows implement."
     },
     "app_flow": {
-      "status": "not_applicable",
-      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no app flow specification to maintain; its workflows are covered by the org reusable-workflow standards."
+      "status": "ready",
+      "documents": [
+        "docs/WAYS-OF-WORKING.md",
+        "README.md"
+      ],
+      "owner": "tech-lead",
+      "coverage": "Documents the operator flow for changes here: branching, PR hygiene, guardian merge, weekly release train and how automation such as auto-sync keeps branches current."
     },
     "design_brief": {
       "status": "not_applicable",
@@ -22,8 +33,13 @@
       "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no backend schema specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "implementation_plan": {
-      "status": "not_applicable",
-      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no implementation plan specification to maintain; its workflows are covered by the org reusable-workflow standards."
+      "status": "ready",
+      "documents": [
+        "docs/WAYS-OF-WORKING.md",
+        "docs/documentation-baseline.md"
+      ],
+      "owner": "tech-lead",
+      "coverage": "Records the adoption sequence for org standards this repository follows, including the documentation baseline and the weekly release cadence, with owners per step."
     }
   }
 }
