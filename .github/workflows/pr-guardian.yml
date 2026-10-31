@@ -409,11 +409,12 @@ jobs:
           # refused for it (no `workflows` permission), so the release-bot App token is used
           # when the mint step produced one. A failure is the PR's own state, not a guardian
           # malfunction: it is logged here and the caller labels the PR instead of failing
-          # the sweep.
+          # the sweep. REST rather than `gh pr update-branch`: the self-hosted runner's gh 2.46
+          # has no such subcommand.
           function Update-WorkflowPrBranch([int]$PrNumber) {
             $guardianToken = $env:GH_TOKEN
             if ($env:GUARDIAN_WORKFLOW_TOKEN) { $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN }
-            try { $updateOut = & gh pr update-branch "$PrNumber" --repo $repo 2>&1 } finally { $env:GH_TOKEN = $guardianToken }
+            try { $updateOut = & gh api -X PUT "repos/$repo/pulls/$PrNumber/update-branch" 2>&1 } finally { $env:GH_TOKEN = $guardianToken }
             $updateExit = $LASTEXITCODE
             $global:LASTEXITCODE = 0
             if ($updateExit -eq 0) { return $true }
