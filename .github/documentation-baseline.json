@@ -2,28 +2,28 @@
   "version": 1,
   "areas": {
     "prd": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no prd specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "trd": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no trd specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "app_flow": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no app flow specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "design_brief": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no design brief specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "backend_schema": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no backend schema specification to maintain; its workflows are covered by the org reusable-workflow standards."
     },
     "implementation_plan": {
-      "status": "pending",
-      "issue": "https://github.com/wiselead-solutions/.github/issues/27"
+      "status": "not_applicable",
+      "reason": "This repository holds organisation-wide GitHub defaults (issue and PR templates, shared workflow files) and has no product surface, so it has no implementation plan specification to maintain; its workflows are covered by the org reusable-workflow standards."
     }
   }
 }
