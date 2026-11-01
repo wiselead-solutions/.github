@@ -324,10 +324,30 @@ jobs:
             "DOCUMENTATION_BASH_PATH=$($documentationBash.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
 
+      # A PR that changes .github/workflows/* cannot be merged (or have its branch updated) by
+      # GITHUB_TOKEN once main has moved: GitHub refuses it for want of the `workflows`
+      # permission, which `permissions:` cannot grant. The wiselead-release-bot App has
+      # `workflows: write`, so the audit step uses this token for the merge and update-branch
+      # calls of THOSE PRs only (ai-org#264, as core-platform's guardian does); every read,
+      # review and label stays on GITHUB_TOKEN. Fail-safe: no App id, a missing key or a
+      # failed mint leaves the output empty and the audit falls back to GITHUB_TOKEN.
+      - name: Mint release-bot token (workflow-touching merges)
+        id: release-bot
+        if: ${{ vars.RELEASE_BOT_APP_ID != '' }}
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
       - name: Audit all open PRs
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GUARDIAN_WORKFLOW_TOKEN: ${{ steps.release-bot.outputs.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $repo = $env:GITHUB_REPOSITORY
@@ -345,6 +365,62 @@ jobs:
             'Risk & Rollout',
             'Reviewer Guidance'
           )
+
+          # Every state-changing gh call goes through this. What it replaces was a bare
+          # `gh ...` followed by a `::warning::` on $LASTEXITCODE, which logged a refused
+          # call but never failed the run - so a guardian that could not record its
+          # verdict still ended green.
+          #
+          # Failures accumulate rather than throwing at the point of failure, so one PR
+          # that cannot be labelled, reviewed or merged does not abandon the rest of the
+          # sweep. The run still fails at the end - a guardian that could not record its
+          # verdict must not report success (core-platform's pr-guardian.yml, same helper).
+          $ghFailures = @()
+
+          function Invoke-Gh {
+            param(
+              [Parameter(Mandatory)][string[]] $GhArgs,
+              [Parameter(Mandatory)][string]   $What,
+              [Parameter(Mandatory)][int]      $Number,
+              # A regex matched against gh's combined output on failure. A match means the
+              # call failed only because the desired end state already holds (e.g. removing
+              # a label the PR does not carry) - a benign race, not a verdict the guardian
+              # failed to record, so it does not count toward $ghFailures.
+              [string] $BenignIfMatches
+            )
+            $out = & gh @GhArgs 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $outText = $out | Out-String
+              if ($BenignIfMatches -and $outText -match $BenignIfMatches) {
+                Write-Host "PR #${Number}: $What was already satisfied (gh exited $LASTEXITCODE) - treating as done"
+                $global:LASTEXITCODE = 0
+                return $true
+              }
+              $script:ghFailures += "PR #${Number}: could not $What (gh exited $LASTEXITCODE)"
+              Write-Host "::error title=Guardian action failed::PR #${Number} - could not $What (gh exited $LASTEXITCODE)"
+              if ($out) { Write-Host $outText }
+              $global:LASTEXITCODE = 0
+              return $false
+            }
+            return $true
+          }
+
+          # ai-org#264: bring a stale workflow-touching PR up to date. GITHUB_TOKEN is
+          # refused for it (no `workflows` permission), so the release-bot App token is used
+          # when the mint step produced one. A failure is the PR's own state, not a guardian
+          # malfunction: it is logged here and the caller labels the PR instead of failing
+          # the sweep. REST rather than `gh pr update-branch`: the self-hosted runner's gh 2.46
+          # has no such subcommand.
+          function Update-WorkflowPrBranch([int]$PrNumber) {
+            $guardianToken = $env:GH_TOKEN
+            if ($env:GUARDIAN_WORKFLOW_TOKEN) { $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN }
+            try { $updateOut = & gh api -X PUT "repos/$repo/pulls/$PrNumber/update-branch" 2>&1 } finally { $env:GH_TOKEN = $guardianToken }
+            $updateExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($updateExit -eq 0) { return $true }
+            Write-Host "PR #$PrNumber update-branch failed (gh exited $updateExit): $($updateOut | Out-String)"
+            return $false
+          }
 
           function Test-GuardianVerdictChanged([int]$PrNumber, [string]$Verdict) {
             $encodedBodies = gh api --paginate "repos/$repo/pulls/$PrNumber/reviews?per_page=100" `
@@ -388,13 +464,12 @@ jobs:
               + ($Reasons -join "`n") `
               + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
             if (Test-GuardianVerdictChanged $PrNumber $comment) {
-              gh pr review $PrNumber --repo $repo --comment --body $comment
-              if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$PrNumber" }
+              [void](Invoke-Gh @('pr', 'review', "$PrNumber", '--repo', $repo, '--comment', '--body', $comment) 'post the blocked verdict' $PrNumber)
             } else { Write-Host "PR #$PrNumber verdict unchanged; not posting a duplicate review" }
             # REST, not `gh pr edit`: that queries the retired Projects Classic
             # GraphQL field on the fleet's gh version and fails.
-            gh api --method POST "repos/$repo/issues/$PrNumber/labels" -f 'labels[]=guardian:blocked' | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not label #$PrNumber" }
+            [void](Invoke-Gh @('api', '--method', 'POST', "repos/$repo/issues/$PrNumber/labels",
+                               '-f', 'labels[]=guardian:blocked') 'apply guardian:blocked' $PrNumber)
           }
 
           # Does any OTHER active workflow in this repo run on pull requests? Read once per
@@ -529,15 +604,11 @@ jobs:
               Write-Host "PR #$num PASSED"
               $comment = "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
               if (Test-GuardianVerdictChanged $num $comment) {
-                gh pr review $num --repo $repo --comment --body $comment
-                if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not post review on #$num" }
+                [void](Invoke-Gh @('pr', 'review', "$num", '--repo', $repo, '--comment', '--body', $comment) 'post the pass verdict' $num)
               } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
               # REST, not `gh pr edit` - see Set-GuardianBlocked. 404 = label not on the PR.
-              $unlabelOut = gh api --method DELETE "repos/$repo/issues/$num/labels/guardian%3Ablocked" 2>&1
-              if ($LASTEXITCODE -ne 0) {
-                if (($unlabelOut | Out-String) -match 'HTTP 404') { Write-Host "removing guardian:blocked from #$num was a no-op" }
-                else { Write-Host "::warning::could not clear guardian:blocked on #$num" }
-              }
+              [void](Invoke-Gh @('api', '--method', 'DELETE', "repos/$repo/issues/$num/labels/guardian%3Ablocked") 'clear guardian:blocked' $num `
+                                -BenignIfMatches 'HTTP 404')
 
               # Merge method keys off the BASE branch. Decided 2026-09-24 (ai-org
               # docs/WAYS-OF-WORKING.md): base-keyed; head-keying squashed release/* and
@@ -567,8 +638,47 @@ jobs:
                 Write-Host "PR #$num not merged: it changed during this audit (head $auditedHead -> $($now.headRefOid), state $($now.state), draft $($now.isDraft), guardian:skip $nowSkip); the next run re-audits it"
                 continue
               }
-              $mergeOut = node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $num --repo $repo $mergeMethod @deleteArgs --match-head-commit $auditedHead 2>&1
-              $mergeExit = $LASTEXITCODE
+              # ai-org#264: whether this PR changes .github/workflows/*, and whether it is behind
+              # its base. GITHUB_TOKEN cannot merge, or update the branch of, such a PR once
+              # main has moved; the merge and update-branch below use the release-bot App
+              # token (GUARDIAN_WORKFLOW_TOKEN, minted by the step above) for THAT PR only.
+              # An unreadable read leaves both false: the old behaviour.
+              $touchesWorkflows = $false
+              $behindBase = $false
+              $prInfoJson = gh pr view $num --repo $repo --json 'files,mergeStateStatus' 2>$null
+              if ($LASTEXITCODE -eq 0 -and $prInfoJson) {
+                try {
+                  $prInfo = $prInfoJson | ConvertFrom-Json
+                  $touchesWorkflows = @($prInfo.files | Where-Object { $_.path -like '.github/workflows/*' }).Count -gt 0
+                  $behindBase = ("$($prInfo.mergeStateStatus)" -ceq 'BEHIND')
+                } catch { Write-Host "PR #$num could not parse files/mergeStateStatus; merging as a non-workflow PR" }
+              }
+              $global:LASTEXITCODE = 0
+
+              # A workflow-touching PR that is BEHIND is brought up to date BEFORE the merge is
+              # attempted; CI re-runs on the new head and a later sweep merges it. If the update
+              # fails the merge is still tried - GITHUB_TOKEN sometimes manages it.
+              $updateTried = $false
+              if ($touchesWorkflows -and $behindBase) {
+                $updateTried = $true
+                Write-Host "PR #$num changes .github/workflows/ and is behind $base - updating its branch before merging"
+                if (Update-WorkflowPrBranch $num) {
+                  Write-Host "PR #$num branch updated from $base; CI re-runs and a later sweep merges it"
+                  continue
+                }
+              }
+
+              $guardianToken = $env:GH_TOKEN
+              if ($touchesWorkflows -and $env:GUARDIAN_WORKFLOW_TOKEN) {
+                Write-Host "PR #$num changes .github/workflows/ - merging under the release-bot App token (ai-org#264)"
+                $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN
+              }
+              try {
+                $mergeOut = node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $num --repo $repo $mergeMethod @deleteArgs --match-head-commit $auditedHead 2>&1
+                $mergeExit = $LASTEXITCODE
+              } finally {
+                $env:GH_TOKEN = $guardianToken
+              }
               if ($mergeExit -eq 0) {
                 Write-Host "PR #$num merged ($mergeMethod)"
               } elseif (($mergeOut | Out-String) -match 'not mergeable|merge commit cannot be cleanly created|[Mm]erge conflict') {
@@ -579,8 +689,31 @@ jobs:
                 Write-Host ($mergeOut | Out-String)
                 Set-GuardianBlocked $num @($conflictReason)
               } else {
-                Write-Host "::warning::could not merge #$num (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
-                Write-Host ($mergeOut | Out-String)
+                $mergeText = $mergeOut | Out-String
+                $updated = $false
+                if ($touchesWorkflows -and -not $updateTried -and $mergeText -notmatch 'Head branch was modified') {
+                  # ai-org#264: the refusal is most likely the missing `workflows` permission on
+                  # a stale workflow PR. Bring the branch up to date; CI re-runs and a later
+                  # sweep merges it.
+                  Write-Host "PR #$num MERGE REFUSED (gh exited $mergeExit):"
+                  Write-Host $mergeText
+                  $updated = Update-WorkflowPrBranch $num
+                  if ($updated) { Write-Host "PR #$num branch updated from $base; CI re-runs and a later sweep merges it" }
+                }
+                if ($updated) {
+                  # Nothing to record: the new head is audited from scratch.
+                } elseif ($touchesWorkflows -and $mergeText -match '(?i)workflow') {
+                  # A real workflow-permission refusal: record the state on the PR, do not
+                  # fail the audit. `guardian:needs-human-merge` is a passed-but-unmergeable
+                  # state, not a variant of `guardian:blocked`. REST, as above.
+                  Write-Host "PR #$num MERGE REFUSED (workflow permission) - labelling guardian:needs-human-merge"
+                  [void](Invoke-Gh @('api', '--method', 'POST', "repos/$repo/issues/$num/labels",
+                                     '-f', 'labels[]=guardian:needs-human-merge') 'apply guardian:needs-human-merge' $num)
+                } else {
+                  $ghFailures += "PR #${num}: could not merge (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
+                  Write-Host "::error title=Guardian action failed::PR #$num - could not merge (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
+                  Write-Host $mergeText
+                }
               }
             }
           }
@@ -589,5 +722,12 @@ jobs:
 
           # THIS JOB ALWAYS SUCCEEDS, DELIBERATELY - see dev-hub's pr-guardian.yml
           # for the full writeup of why a red audit check becomes a permanent
-          # self-inflicted block.
+          # self-inflicted block - EXCEPT when a verdict could not be recorded: a guardian
+          # that cannot post what it decided must not report success. This run's own check
+          # is excluded from every PR's CI read above, so failing here cannot block a PR.
+          if ($ghFailures.Count -gt 0) {
+            Write-Host ''
+            foreach ($f in $ghFailures) { Write-Host $f }
+            throw "Guardian could not record its verdict on $($ghFailures.Count) action(s). A guardian that cannot post what it decided must not report success."
+          }
           exit 0
