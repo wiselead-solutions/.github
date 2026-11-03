@@ -433,18 +433,28 @@ jobs:
               if (mode === '--verify') {
                 process.stdout.write(JSON.stringify(result));
               } else if (mode === '--merge') {
-                // The guardian must make the merge decision now, not arm a future unchecked merge.
-                const mergeArgs = args.filter(arg => arg !== '--auto');
-                if (matchIndex < 0) mergeArgs.push('--match-head-commit', result.head);
-                if (!mergeArgs.includes('--repo')) mergeArgs.push('--repo', repo);
-                // ai-org#264: the guardian sets GUARDIAN_MERGE_TOKEN (the release-bot App token) only
-                // for a PR that changes .github/workflows/*; only this merge call uses it.
+                // REST merge is synchronous: it refuses queue-only policies rather than arming auto-merge.
+                const method = ['squash', 'rebase', 'merge'].find(value => args.includes('--' + value));
+                if (!method) throw Error('An explicit supported merge method is required.');
                 const mergeToken = process.env.GUARDIAN_MERGE_TOKEN;
-                process.stdout.write(execFileSync(ghPath, ['pr', 'merge', ...mergeArgs], {
-                  encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+                const options = { encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
                   stdio: ['ignore', 'pipe', 'pipe'],
-                  env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env,
-                }));
+                  env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env };
+                let merged;
+                try {
+                  merged = JSON.parse(execFileSync(ghPath, ['api', `repos/${repo}/pulls/${number}/merge`,
+                    '--method', 'PUT', '-f', `sha=${result.head}`, '-f', `merge_method=${method}`], options));
+                  if (merged.merged !== true) throw Error(merged.message || 'GitHub refused the immediate merge.');
+                } catch (mergeError) {
+                  // A response can be lost after the server commits the merge. Confirm before reporting refusal.
+                  let observed;
+                  try { observed = api(`repos/${repo}/pulls/${number}`); } catch { throw mergeError; }
+                  if (observed.merged !== true || observed.head?.sha !== result.head) throw mergeError;
+                  log('Server confirmed the audited head merged after an ambiguous API result.');
+                  merged = { merged: true, sha: observed.merge_commit_sha, message: 'Confirmed merged state' };
+                }
+                // Branch cleanup is intentionally separate from merge; repository auto-delete may perform it.
+                process.stdout.write(JSON.stringify(merged));
               } else {
                 const [command, ...commandArgs] = args.slice(2);
                 // Used only for Shakad's existing trusted merge-method fallback script.
@@ -508,6 +518,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
 
           $merged = $false
+          $mergeAttempted = $false
           $appMerged = $false
           $tokenMerged = $false
 
@@ -571,7 +582,7 @@ jobs:
             $workflowFiles = @(Get-ChildItem -LiteralPath '.github/workflows' -File -ErrorAction Stop | Where-Object { $_.Extension -in '.yml', '.yaml' -and $_.Name -ne 'pr-guardian.yml' })
             $ciExpected = @($workflowFiles | Where-Object {
               $source = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
-              $source -match '(?m)^\s{2}["'']?pull_request(?:_target)?["'']?:' -or $source -match '(?m)^on:\s*(?:\[|\{)?\s*["'']?pull_request(?:_target)?\b'
+              $source -match '\bpull_request(?:_target)?\b' -or $source -notmatch '(?m)^["'']?on["'']?\s*:'
             }).Count -gt 0
           } catch { $ciExpected = $true }
           $reviewerGateApplies = $false
@@ -774,7 +785,7 @@ jobs:
                 continue
               }
               if ($ghFailures.Count -gt $failuresBefore) { Write-Host "PR #$NUM not merged: verdict actions failed"; continue }
-              if ($merged) {
+              if ($merged -or $mergeAttempted) {
                 Write-Host "PR #$NUM PASSED but already merged one PR this sweep -- leaving it for the next sweep (#2140)."
               } else {
                 $mergeMethod = if ($BASE_REF -eq $env:GUARDIAN_DEFAULT_BRANCH -and "$($pr.headRefName)" -cmatch '^(release|hotfix|backmerge)/') { '--merge' } else { '--squash' }
@@ -801,7 +812,6 @@ jobs:
                     $mergeMethod = "--$fallback"
                   }
                 }
-                $deleteArgs = @(if ($HEAD_REF -cne $env:GUARDIAN_DEFAULT_BRANCH -and $HEAD_REF -notmatch '^(develop|main)$|^(release|hotfix)/') { '--delete-branch' })
                 $nowJson = gh pr view $NUM --json 'headRefOid,isDraft,state,labels,body,assignees,reviewRequests,baseRefName'
                 $nowOk = ($LASTEXITCODE -eq 0)
                 $global:LASTEXITCODE = 0
@@ -832,7 +842,8 @@ jobs:
                 } else {
                   Remove-Item Env:GUARDIAN_MERGE_TOKEN -ErrorAction SilentlyContinue
                 }
-                $MERGE_OUT = (node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $NUM $mergeMethod @deleteArgs --match-head-commit $auditedHead 2>&1 | Out-String).Trim()
+                $mergeAttempted = $true
+                $MERGE_OUT = (node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $NUM $mergeMethod --match-head-commit $auditedHead 2>&1 | Out-String).Trim()
                 if ($LASTEXITCODE -eq 0) {
                   $merged = $true
                   "merged_base=$BASE_REF" | Add-Content -LiteralPath $env:GITHUB_OUTPUT

@@ -272,18 +272,28 @@ if (require.main === module) {
     if (mode === '--verify') {
       process.stdout.write(JSON.stringify(result));
     } else if (mode === '--merge') {
-      // The guardian must make the merge decision now, not arm a future unchecked merge.
-      const mergeArgs = args.filter(arg => arg !== '--auto');
-      if (matchIndex < 0) mergeArgs.push('--match-head-commit', result.head);
-      if (!mergeArgs.includes('--repo')) mergeArgs.push('--repo', repo);
-      // ai-org#264: the guardian sets GUARDIAN_MERGE_TOKEN (the release-bot App token) only
-      // for a PR that changes .github/workflows/*; only this merge call uses it.
+      // REST merge is synchronous: it refuses queue-only policies rather than arming auto-merge.
+      const method = ['squash', 'rebase', 'merge'].find(value => args.includes('--' + value));
+      if (!method) throw Error('An explicit supported merge method is required.');
       const mergeToken = process.env.GUARDIAN_MERGE_TOKEN;
-      process.stdout.write(execFileSync(ghPath, ['pr', 'merge', ...mergeArgs], {
-        encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+      const options = { encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env,
-      }));
+        env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env };
+      let merged;
+      try {
+        merged = JSON.parse(execFileSync(ghPath, ['api', `repos/${repo}/pulls/${number}/merge`,
+          '--method', 'PUT', '-f', `sha=${result.head}`, '-f', `merge_method=${method}`], options));
+        if (merged.merged !== true) throw Error(merged.message || 'GitHub refused the immediate merge.');
+      } catch (mergeError) {
+        // A response can be lost after the server commits the merge. Confirm before reporting refusal.
+        let observed;
+        try { observed = api(`repos/${repo}/pulls/${number}`); } catch { throw mergeError; }
+        if (observed.merged !== true || observed.head?.sha !== result.head) throw mergeError;
+        log('Server confirmed the audited head merged after an ambiguous API result.');
+        merged = { merged: true, sha: observed.merge_commit_sha, message: 'Confirmed merged state' };
+      }
+      // Branch cleanup is intentionally separate from merge; repository auto-delete may perform it.
+      process.stdout.write(JSON.stringify(merged));
     } else {
       const [command, ...commandArgs] = args.slice(2);
       // Used only for Shakad's existing trusted merge-method fallback script.

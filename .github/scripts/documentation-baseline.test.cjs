@@ -125,7 +125,7 @@ function cli(manifest, extraArgs=[]) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'documentation-gate-'));
   const gh=path.join(dir,'gh');
   const log=path.join(dir,'calls.jsonl');
-  const cfg={manifest,body:body('unchanged'),head:'a'.repeat(40)};
+  const cfg={manifest,body:body('unchanged'),head:'a'.repeat(40),outcome:extraArgs.find(arg=>arg.startsWith('fixture:'))};
   fs.writeFileSync(path.join(dir,'fixture.json'),JSON.stringify(cfg));
   fs.writeFileSync(gh, `#!/usr/bin/env node
 const fs=require('node:fs');
@@ -133,9 +133,14 @@ const path=require('node:path');
 const cfg=JSON.parse(fs.readFileSync(path.join(__dirname,'fixture.json'),'utf8'));
 const args=process.argv.slice(2);
 fs.appendFileSync(path.join(__dirname,'calls.jsonl'),JSON.stringify(args)+'\\n');
-if(args[0]==='api' && args[1].endsWith('/pulls/1')) console.log(JSON.stringify({state:'open',draft:false,head:{sha:cfg.head},base:{sha:'b'.repeat(40)},body:cfg.body,labels:[],changed_files:1}));
+if(args[0]==='api' && args[1].endsWith('/pulls/1')) console.log(JSON.stringify({state:'open',merged:fs.existsSync(path.join(__dirname,'server-merged')),draft:false,head:{sha:cfg.head},base:{sha:'b'.repeat(40)},body:cfg.body,labels:[],changed_files:1}));
 else if(args[0]==='api' && args[1].includes('/files?')) console.log(JSON.stringify([{filename:'src/app.cs',status:'modified'}]));
 else if(args[0]==='api' && args[1].includes('/contents/')) console.log(JSON.stringify({type:'file',encoding:'base64',content:Buffer.from(args[1].includes('documentation-baseline.json')?JSON.stringify(cfg.manifest):'Verified canonical specification. '.repeat(10)).toString('base64')}));
+else if(args[0]==='api' && args[1].endsWith('/merge')) {
+  if(cfg.outcome==='fixture:refused') console.log(JSON.stringify({merged:false,message:'Queue policy requires a queue'}));
+  else if(cfg.outcome==='fixture:lost-response') { fs.writeFileSync(path.join(__dirname,'server-merged'),'yes'); process.exit(1); }
+  else console.log(JSON.stringify({merged:true,sha:cfg.head}));
+}
 else console.log('done');
 `,{mode:0o755});
   const result=spawnSync(process.execPath,[path.join(scriptDirectory,'documentation-baseline.cjs'),'--merge','wiselead-solutions/example','1','--squash',...extraArgs],{
@@ -147,8 +152,9 @@ else console.log('done');
 }
 test('CLI only executes a commit-bound merge after the positive audit',()=>{
   const {result,calls}=cli(ready(),['--auto']);assert.equal(result.status,0,result.stderr);
-  const merges=calls.filter(args=>args[0]==='pr'&&args[1]==='merge');assert.equal(merges.length,1);
-  assert.ok(merges[0].includes('--match-head-commit'));assert.ok(merges[0].includes('a'.repeat(40)));
+  const merges=calls.filter(args=>args[0]==='api'&&args[1].endsWith('/merge'));assert.equal(merges.length,1);
+  assert.ok(merges[0].includes('PUT'));assert.ok(merges[0].includes('sha='+'a'.repeat(40)));
+  assert.ok(merges[0].includes('merge_method=squash'));
   assert.ok(!merges[0].includes('--auto'));
 });
 test('CLI pending baseline never merges; disarms existing auto-merge and records a blocked label',()=>{
@@ -158,7 +164,18 @@ test('CLI pending baseline never merges; disarms existing auto-merge and records
 });
 test('CLI stale audited head cannot reach a merge',()=>{
   const {result,calls}=cli(ready(),['--match-head-commit','c'.repeat(40)]);assert.equal(result.status,1);
-  assert.match(result.stderr,/head changed/);assert.ok(!calls.some(args=>args[0]==='pr'&&args[1]==='merge'&&!args.includes('--disable-auto')));
+  assert.match(result.stderr,/head changed/);assert.ok(!calls.some(args=>args[0]==='api'&&args[1].endsWith('/merge')));
+});
+
+test('CLI immediate merge refuses queue-only responses without scheduling auto-merge',()=>{
+  const {result,calls}=cli(ready(),['fixture:refused']);
+  assert.equal(result.status,1); assert.match(result.stderr,/Queue policy/);
+  assert.ok(!calls.some(args=>args[0]==='pr'&&args[1]==='merge'&&!args.includes('--disable-auto')));
+});
+test('CLI confirms a committed merge after a lost API response',()=>{
+  const {result,calls}=cli(ready(),['fixture:lost-response']);
+  assert.equal(result.status,0,result.stderr); assert.equal(JSON.parse(result.stdout).merged,true);
+  assert.equal(calls.filter(args=>args[0]==='api'&&args[1].endsWith('/merge')).length,1);
 });
 
 // guardian-standard:tests:start
@@ -174,7 +191,7 @@ test('CLI stale audited head cannot reach a merge',()=>{
   const auditG = matchG ? matchG[1].split(/\r?\n/).map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n') : '';
   test('guardian shared audit has the reviewed canonical digest', () => {
     assert.ok(matchG, 'shared audit extraction markers must remain');
-    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), '1e491d6a20c6d31edfa394c185fe5d9ab117520ac6c6502d0a8a425694fa7b72');
+    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), 'e0dd62cf2a71004132849abcdbacca5da5d14491409654b1b184b3282ef2cb48');
   });
   const bodyG = ['Executive Summary','Technical Summary','Testing','Risk & Rollout','Reviewer Guidance'].map(s => `## ${s}\nVerified change and evidence.`).join('\n\n')+'\nPart of #123';
   const prG = overrides => ({number:1,title:'Standard fixture',body:bodyG,isDraft:false,state:'OPEN',assignees:[{login:'owner'}],reviewRequests:[],labels:[],headRefName:'feature/standard',baseRefName:'main',headRefOid:'a'.repeat(40),author:{login:'owner'},autoMergeRequest:null,...overrides});
@@ -241,7 +258,7 @@ function node {
       fsG.writeFileSync(fixture,JSON.stringify({prs:[prG()],checks:[checkG()],...config}));
       fsG.writeFileSync(calls,'');fsG.writeFileSync(output,'');
       fsG.mkdirSync(pathG.join(dir,'.github/workflows'),{recursive:true});
-      fsG.writeFileSync(pathG.join(dir,'.github/workflows',config.onlyGuardian?'pr-guardian.yml':'fixture.yml'),config.ciFree?'on: workflow_dispatch\n':'on:\n  pull_request:\n');
+      fsG.writeFileSync(pathG.join(dir,'.github/workflows',config.onlyGuardian?'pr-guardian.yml':'fixture.yml'),config.workflowSource||(config.ciFree?'on: workflow_dispatch\n':'on:\n  pull_request:\n'));
       const scripts=pathG.join(dir,'audit.ps1');fsG.writeFileSync(scripts,harnessG+'\n'+script);
       const result=cpG.spawnSync('pwsh',['-NoLogo','-NoProfile','-NonInteractive','-File',scripts],{encoding:'utf8',timeout:30000,cwd:dir,env:{...process.env,GH_TOKEN:'fixture-only-token',GUARDIAN_MERGE_TOKEN:'',GUARDIAN_WORKFLOW_TOKEN:'',GUARDIAN_REQUIRE_REVIEWER:'false',GUARDIAN_RELEASE_METADATA_EXEMPT:'false',GUARDIAN_AUDIT_HELD:'false',GUARDIAN_STALE_BASE_THRESHOLD:'0',GUARDIAN_DEFAULT_BRANCH:'main',DOCUMENTATION_VALIDATOR_PATH:'fixture-only',GITHUB_REPOSITORY:'wiselead-solutions/example',GITHUB_RUN_ID:'101',GITHUB_OUTPUT:output,GUARDIAN_FIXTURE:fixture,GUARDIAN_CALLS:calls,...env}});
       const logged=fsG.readFileSync(calls,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
@@ -262,6 +279,9 @@ function node {
     ['pending CI',{checks:[checkG('',{status:'IN_PROGRESS'})]},false],
     ['unreadable CI',{ciFail:true},false],
     ['empty CI',{checks:[]},false],
+    ['inline event list PR second',{checks:[],workflowSource:'on: [push, pull_request]\n'},false],
+    ['quoted event key',{checks:[],workflowSource:'"on":\n  pull_request:\n'},false],
+    ['unrecognised workflow structure',{checks:[],workflowSource:'unknown: event-source\n'},false],
     ['CI-free repository',{checks:[],ciFree:true},true],
     ['repository with only its Guardian',{checks:[],onlyGuardian:true},true],
     ['unreadable CI-free response',{ciFree:true,ciFail:true},false],
@@ -296,6 +316,9 @@ function node {
     }
     const batch=runG({prs:[prG(),prG({number:2})]});
     assert.equal(batch.merged.length,1,'at most one merge per sweep');
+    const refusedBatch=runG({prs:[prG(),prG({number:2})],mergeFail:true});
+    assert.equal(refusedBatch.merged.length,1,'an ambiguous first attempt must prevent a second merge attempt');
+    assert.doesNotMatch(auditG,/--delete-branch/,'branch cleanup must not obscure the merge outcome');
     const failedList=runG({listFail:true});assert.notEqual(failedList.result.status,0,'unreadable inventory cannot mean zero PRs');
     const unrelated=runG({staleReview:true,unrelatedBotReview:true});
     assert.ok(unrelated.logged.some(c=>c.args.some(a=>String(a).includes('/reviews/500/dismissals'))),'dismiss own stale review');

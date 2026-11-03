@@ -53,11 +53,15 @@ The shared audit:
    compares the body digest, base, assignees and requested-reviewer count with the audit.
 6. Dismisses only `github-actions[bot]` changes-requested reviews marked as PR Guardian.
    Human reviews and other automation reviews remain intact. Unchanged verdicts are not reposted.
-7. Re-reads metadata and holds, then requests an immediate merge bound to the audited head.
+7. Re-reads metadata and holds, then requests a synchronous REST merge bound to the audited head.
+   Queue-only rules refuse this request; the Guardian never arms deferred auto-merge. A lost
+   response requires server confirmation of the merged audited head. Branch cleanup is separate
+   from the merge result and may be handled by repository auto-delete settings.
    Feature PRs squash; release, hotfix and backmerge PRs prefer a merge commit into the default
    branch. Repository settings and effective rulesets can require a supported fallback.
    Long-lived branches are retained.
-8. Merges at most one PR per sweep, allowing the next sweep to read a fresh base. Every PR is
+8. Attempts at most one merge per sweep, allowing the next sweep to read a fresh base even
+   after an ambiguous result. Every PR is
    still audited. Failed review or label writes prevent that PR's merge; failures accumulate
    and fail the final workflow step after any required post-merge dispatch.
 
