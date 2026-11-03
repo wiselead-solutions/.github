@@ -1,88 +1,166 @@
+# Standard: Rejist guardian v1. Canonical source: product-scaffold/templates/workflows/pr-guardian.yml.template.
+# Read docs/pr-guardian-standard.md before changing the shared merge policy.
 name: .github - PR Guardian
-
-# Hygiene gate for this repository, added because it had no PR gate of any
-# kind - no workflows directory at all. Modelled on the fixed, current
-# generation of this org's guardians (dev-hub, wiselead-marketing, tasker):
-# read CI state from statusCheckRollup rather than `gh pr checks` text
-# output (the runner's gh 2.46 has no --json support on that subcommand, and
-# text-parsing an empty/failed API response is indistinguishable from "no
-# checks" - which several guardians in this org have merged straight
-# through), post COMMENT reviews rather than approve/request-changes (the
-# default GITHUB_TOKEN cannot later approve to clear its own
-# CHANGES_REQUESTED), and merge directly with no `--auto` (auto-merge waits
-# on required status checks, and this repo configures none).
-#
-# ZERO CHECKS passes ONLY while no other workflow in this repo runs on pull
-# requests (owner, 2026-10-04). This repo had no CI workflow at all, so an
-# empty check list was the steady state and blocking on it would leave every
-# PR permanently unmergeable. The guard now reads the repo's active workflows
-# once per sweep: the moment one of them runs on pull_request, an empty list
-# means "CI has not reported yet" and blocks, like dev-hub/wiselead-marketing/
-# academy-programs. An unreadable workflow list counts as "CI expected". When
-# CI is added here, also list it under `on.workflow_run.workflows` so its
-# completion re-runs this guard.
 
 on:
   workflow_dispatch:
+  # Always run trusted base-branch policy; never check out or execute PR code here.
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft, assigned, unassigned, review_requested, review_request_removed, labeled, unlabeled]
   schedule:
     - cron: '*/15 * * * *'
-  pull_request:
-    # Every change to the PR re-audits it (owner, 2026-10-04): commits, title/body edits,
-    # draft state, assignees, review requests, and the `guardian:skip` label. labeled/unlabeled
-    # are listened to only for `guardian:skip`: the job's `if:` drops every other label event,
-    # because the guard writes its own labels (`guardian:blocked` and others).
-    types: [opened, edited, reopened, synchronize, ready_for_review, converted_to_draft, assigned, unassigned, review_requested, review_request_removed, labeled, unlabeled]
-  # A review submitted or dismissed changes what the guard sees too.
-  pull_request_review:
-    types: [submitted, dismissed]
 
 permissions:
   contents: write
-  issues: write        # gh label create
   pull-requests: write
   checks: read
   actions: read
 
 jobs:
   guard:
-    name: Audit open PRs
-    # Self-loop guards (owner, 2026-10-04). A review by a bot (Copilot's review, or the
-    # guardian's own `gh pr review` verdict should it ever run under a token that triggers
-    # workflows) must not fan out another sweep. `labeled`/`unlabeled` are triggers only so
-    # that adding or removing `guardian:skip` re-audits at once; any other label event is
-    # dropped here, because the guard writes its own labels (`guardian:blocked` and others).
+    name: Audit Open PRs
     if: >-
-      (github.event_name != 'pull_request_review' || github.event.review.user.type != 'Bot')
-      && (github.event_name != 'pull_request'
+      github.event_name != 'pull_request_target'
       || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
-      || github.event.label.name == 'guardian:skip')
-    # ONE repository-wide group (owner, 2026-10-04). Every run sweeps EVERY open PR, so a
-    # per-PR or per-branch key let events on two different PRs start two overlapping sweeps
-    # that raced on the same reviews, labels and merges. With one group and no
-    # cancel-in-progress, GitHub keeps the sweep already running plus ONE pending run and
-    # drops superseded pending ones; each run re-reads the whole open-PR set, so a dropped
-    # one cannot skip a PR. A dropped `pull_request` run shows as a cancelled check on its PR;
-    # the CI gate below excludes every run of this workflow, so it never blocks the PR.
-    # Job-level rather than workflow-level so a run the `if:` above skips never enters the
-    # group and never displaces a real pending sweep.
+      || contains(fromJSON('["guardian:skip","hold","blocked:owner","paused-hold"]'), github.event.label.name)
     concurrency:
       group: pr-guardian-${{ github.repository }}
       cancel-in-progress: false
-    runs-on: [self-hosted, linux]
+    runs-on: [self-hosted]
+    env:
+      GUARDIAN_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      GUARDIAN_REQUIRE_REVIEWER: 'false'
+      GUARDIAN_RELEASE_METADATA_EXEMPT: 'false'
+      GUARDIAN_AUDIT_HELD: 'false'
+      GUARDIAN_STALE_BASE_THRESHOLD: '0'
     steps:
+      - name: Checkout trusted policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # The reviewed Rejist runtime helper is embedded; no cross-private-repo access is needed.
+      - name: Verify job-local PowerShell
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
+        with:
+          retries: 0
+          script: |
+            "use strict";
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const https = require("node:https");
+            const crypto = require("node:crypto");
+            const { pipeline } = require("node:stream/promises");
+            const { spawnSync } = require("node:child_process");
+
+            const VERSION = "7.5.11";
+            const ASSETS = Object.freeze({
+              arm64: Object.freeze({ name: `powershell-${VERSION}-osx-arm64.tar.gz`, sha256: "93C5D5B71A3937E3DBB68934886D318689F57ECDA466443764A9D7101F196E6F" }),
+              x64: Object.freeze({ name: `powershell-${VERSION}-osx-x64.tar.gz`, sha256: "44828C7173CDDB335570A76089F2831B9082997EABAFD599B115AAA944F90E69" })
+            });
+            const PROBE = "$ErrorActionPreference='Stop'; $dictionary=[System.Collections.Concurrent.ConcurrentDictionary[string,string]]::new(); if($dictionary.Count -ne 0){exit 1}; $PSVersionTable.PSVersion.ToString()";
+            const MAX_BYTES = 300 * 1024 * 1024;
+            const ALLOWED_HOSTS = new Set(["github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]);
+
+            async function download(url, destination, deadline = Date.now() + 120000, redirects = 0) {
+              const parsed = new URL(url);
+              if (parsed.protocol !== "https:" || !ALLOWED_HOSTS.has(parsed.hostname) || parsed.username || parsed.password || (parsed.port && parsed.port !== "443") || redirects > 5)
+                throw new Error("PowerShell download redirect is not an approved HTTPS release host");
+              const remaining = deadline - Date.now();
+              if (remaining <= 0) throw new Error("PowerShell download timed out");
+              return new Promise((resolve, reject) => {
+                let timer;
+                const finish = error => { clearTimeout(timer); error ? reject(error) : resolve(); };
+                const request = https.get(parsed, { headers: { "User-Agent": "wiselead-ops-pwsh-bootstrap" } }, response => {
+                  if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
+                    response.resume();
+                    if (!response.headers.location) { finish(new Error("PowerShell download redirect has no location")); return; }
+                    download(new URL(response.headers.location, parsed).href, destination, deadline, redirects + 1).then(() => finish(), finish);
+                    return;
+                  }
+                  if (response.statusCode !== 200 || Number(response.headers["content-length"] || 0) > MAX_BYTES) {
+                    response.resume(); finish(new Error("PowerShell release download failed or exceeds its size limit")); return;
+                  }
+                  let size = 0;
+                  response.on("data", chunk => { size += chunk.length; if (size > MAX_BYTES) response.destroy(new Error("PowerShell release exceeds its size limit")); });
+                  pipeline(response, fs.createWriteStream(destination, { flags: "wx", mode: 0o600 })).then(() => finish(), finish);
+                });
+                timer = setTimeout(() => {
+                  const error = new Error("PowerShell download timed out");
+                  request.destroy(error);
+                  finish(error);
+                }, remaining);
+                request.on("error", finish);
+              });
+            }
+
+            const realIO = {
+              run: (command, args) => spawnSync(command, args, { encoding: "utf8", timeout: 30000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }),
+              realpath: filename => fs.realpathSync(filename),
+              mkdtemp: prefix => fs.mkdtempSync(prefix),
+              chmod: (filename, mode) => fs.chmodSync(filename, mode),
+              download,
+              sha256: async filename => {
+                const hash = crypto.createHash("sha256");
+                for await (const chunk of fs.createReadStream(filename)) hash.update(chunk);
+                return hash.digest("hex").toUpperCase();
+              },
+              appendPath: (filename, directory) => fs.appendFileSync(filename, directory + "\n", { encoding: "utf8" })
+            };
+
+            function probe(io, command) {
+              const result = io.run(command, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PROBE]);
+              const version = String(result.stdout || "").trim();
+              return result.status === 0 && !result.error && /^7\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$/.test(version) ? version : null;
+            }
+
+            async function ensurePwsh({ platform = process.platform, arch = process.arch, env = process.env, io = realIO, log = () => {} } = {}) {
+              const existing = probe(io, "pwsh");
+              if (existing) { log(`PowerShell ${existing} passed the runtime health probe; keeping the existing runtime.`); return { runtime: "existing", version: existing }; }
+              if (platform !== "darwin" || !Object.hasOwn(ASSETS, arch)) throw new Error("Unhealthy PowerShell on an unsupported OS or architecture; refusing to bypass CI");
+              const runnerTemp = env.RUNNER_TEMP;
+              const githubPath = env.GITHUB_PATH;
+              for (const [name, value] of [["RUNNER_TEMP", runnerTemp], ["GITHUB_PATH", githubPath]]) {
+                if (!value || !path.isAbsolute(value) || /[\r\n]/.test(value) || path.resolve(value) === path.parse(value).root)
+                  throw new Error(`${name} must be a nonempty absolute, non-root path`);
+              }
+              const tempRoot = io.realpath(runnerTemp);
+              if (!path.isAbsolute(tempRoot) || /[\r\n]/.test(tempRoot) || path.resolve(tempRoot) === path.parse(tempRoot).root)
+                throw new Error("Resolved RUNNER_TEMP must remain an absolute, non-root directory");
+              const directory = io.mkdtemp(path.join(tempRoot, "ops-pwsh-"));
+              const resolvedDirectory = io.realpath(directory);
+              const relative = path.relative(tempRoot, resolvedDirectory);
+              if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative) || path.dirname(resolvedDirectory) !== tempRoot)
+                throw new Error("Job-local PowerShell directory escaped RUNNER_TEMP");
+              io.chmod(resolvedDirectory, 0o700);
+              const asset = ASSETS[arch];
+              const archive = path.join(resolvedDirectory, "powershell.tar.gz");
+              await io.download(`https://github.com/PowerShell/PowerShell/releases/download/v${VERSION}/${asset.name}`, archive);
+              if (await io.sha256(archive) !== asset.sha256) throw new Error("PowerShell archive checksum mismatch; extraction refused");
+              const extraction = io.run("tar", ["-xzf", archive, "-C", resolvedDirectory]);
+              if (extraction.status !== 0 || extraction.error) throw new Error("PowerShell archive extraction failed");
+              const executable = path.join(resolvedDirectory, "pwsh");
+              io.chmod(executable, 0o700);
+              if (probe(io, executable) !== VERSION) throw new Error("Job-local PowerShell failed its startup and dictionary health probe");
+              io.appendPath(githubPath, resolvedDirectory);
+              log(`Checksum-verified job-local PowerShell ${VERSION} passed its health probe.`);
+              return { runtime: "job-local", version: VERSION, directory: resolvedDirectory };
+            }
+            await ensurePwsh({ log: message => core.info(message) });
       - name: Set up documentation gate runtime
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
 
       - name: Prepare documentation enforcement
-        shell: pwsh
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $documentationValidatorPath = Join-Path $env:RUNNER_TEMP 'documentation-baseline.cjs'
           $documentationValidatorSource = @'
           'use strict';
-          
+
           // This source is embedded in the trusted guardian workflow. PR files are data only.
           const { execFileSync } = require('node:child_process');
           const crypto = require('node:crypto');
@@ -106,22 +184,28 @@ jobs:
           const docPath = value => typeof value === 'string' &&
             /^(?:[A-Za-z0-9_. -]+\/)*[A-Za-z0-9_. -]+\.md$/.test(value) &&
             !value.split('/').some(part => part === '.' || part === '..');
+          const canonical = value => JSON.stringify(value, (key, item) => item && typeof item === 'object' && !Array.isArray(item)
+            ? Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]])) : item);
           const digest = body => crypto.createHash('sha256').update(body || '').digest('hex');
-          
+
           const REGRESSION_FILES = new Map([
             ['wiselead-solutions/ai-org', 'tools/test_validate.py'],
             ['wiselead-solutions/rejist', '.github/tools/test_deploy_routing.py'],
           ]);
-          
+
           function documentationOnly(files, repository) {
             // Only documentation paths, not all Markdown: runtime/agents/*.md can be executable policy.
             const safe = path => POLICY_FILES.has(path) || path === REGRESSION_FILES.get(repository) ||
               /^(?:README|readme|PRD|TRD|DECISIONS|SETUP|TESTING|BOOTSTRAP|HANDOVER|MEMORY|PROJECT-DETAILS)\.md$/.test(path) ||
               /^docs\/(?!.*(?:^|\/)\.\.(?:\/|$)).+\.md$/.test(path);
-            return files.length > 0 && files.every(file => safe(file.filename) &&
+            // Maintaining the enforcement assets is documentation work; deleting or renaming one away
+            // removes the gate itself, so that never rides the bootstrap exemption.
+            const dropsPolicy = file => (file.status === 'removed' && POLICY_FILES.has(file.filename)) ||
+              (Boolean(file.previous_filename) && file.previous_filename !== file.filename && POLICY_FILES.has(file.previous_filename));
+            return files.length > 0 && files.every(file => safe(file.filename) && !dropsPolicy(file) &&
               (!file.previous_filename || safe(file.previous_filename)));
           }
-          
+
           function withoutDelimited(text, opening, closing) {
             const pieces = [];
             let offset = 0;
@@ -135,7 +219,7 @@ jobs:
             }
             return pieces.join('');
           }
-          
+
           function impactRows(body, reasons) {
             const rows = new Map();
             const visible = withoutDelimited(withoutDelimited(body || '', '<!--', '-->'), '```', '```');
@@ -148,7 +232,7 @@ jobs:
             }
             return rows;
           }
-          
+
           function validateReady(area, entry, readDocument, reasons) {
             if (!Array.isArray(entry.documents) || entry.documents.length === 0 ||
                 entry.documents.length > 12 || entry.documents.some(path => !docPath(path))) {
@@ -168,7 +252,7 @@ jobs:
             }
             return true;
           }
-          
+
           function validateImpact(area, entry, row, changed, reasons) {
             if (!row || !prose(row.evidence)) {
               reasons.push(`${area}: add one documentation-impact table row with concrete evidence/reason.`); return;
@@ -187,11 +271,20 @@ jobs:
               reasons.push(`${area}: a canonical document changed; declare updated.`);
             }
           }
-          
+
           function validateArea(area, entry, context) {
-            const { docsOnly, readDocument, rows, changed, reasons } = context;
+            const { docsOnly, readDocument, rows, changed, reasons, baseManifest } = context;
             if (!entry || !['ready', 'pending', 'not_applicable'].includes(entry.status)) {
               reasons.push(`${area}: invalid status; use ready, pending or not_applicable.`); return;
+            }
+            const baseEntry = baseManifest && baseManifest.version === 1 && baseManifest.areas ? baseManifest.areas[area] : null;
+            if (!docsOnly && entry.status !== 'pending' && (!baseEntry || baseEntry.status === 'pending')) {
+              reasons.push(`${area}: base branch manifest is pending or unreadable; land the adoption as a documentation-only PR before implementation.`);
+              return;
+            }
+            if (!docsOnly && entry.status !== 'pending' && canonical(entry) !== canonical(baseEntry)) {
+              reasons.push(`${area}: an implementation PR cannot change this area's manifest entry; land manifest changes as a documentation-only PR.`);
+              return;
             }
             if (entry.status === 'pending') {
               if (!/^https:\/\/github\.com\/wiselead-solutions\/[A-Za-z0-9_.-]+\/issues\/[1-9]\d*$/.test(entry.issue || '')) {
@@ -205,8 +298,8 @@ jobs:
             } else if (!validateReady(area, entry, readDocument, reasons)) return;
             if (!docsOnly) validateImpact(area, entry, rows.get(area), changed, reasons);
           }
-          
-          function validate({ manifest, files, body, readDocument, repository }) {
+
+          function validate({ manifest, baseManifest = manifest, files, body, readDocument, repository }) {
             const reasons = [];
             const docsOnly = documentationOnly(files, repository);
             if (!manifest || manifest.version !== 1 || !manifest.areas ||
@@ -215,17 +308,71 @@ jobs:
             }
             const changed = new Set(files.filter(f => f.status !== 'removed').map(f => f.filename));
             const rows = impactRows(body, reasons);
-            const context = { docsOnly, readDocument, rows, changed, reasons };
+            const context = { docsOnly, readDocument, rows, changed, reasons, baseManifest };
             for (const area of AREAS) validateArea(area, manifest.areas[area], context);
             return { ok: reasons.length === 0, reasons, documentationOnly: docsOnly };
           }
-          
-          function audit(repository, number, expectedHead, api) {
+
+          function auditState(pr) {
+            return {
+              head: pr.head?.sha, base: pr.base?.sha, body: digest(pr.body), state: pr.state, draft: Boolean(pr.draft),
+              changed_files: pr.changed_files,
+              base_ref: pr.base?.ref,
+              assignees: JSON.stringify((pr.assignees || []).map(user => user.login).sort()),
+              reviewers: JSON.stringify([...(pr.requested_reviewers || []).map(user => user.login), ...(pr.requested_teams || []).map(team => 'team:' + team.slug)].sort()),
+              // A JSON list, not a joined string: a label name may itself contain the separator.
+              labels: JSON.stringify((pr.labels || []).map(label => String(label.name || '').toLowerCase())
+                .filter(name => name !== 'guardian:blocked').sort((a, b) => a.localeCompare(b))),
+            };
+          }
+
+          function changedFields(before, after) {
+            const was = auditState(before), now = auditState(after);
+            return Object.keys(was).filter(key => was[key] !== now[key])
+              .map(key => `${key} ${JSON.stringify(was[key])} -> ${JSON.stringify(now[key])}`);
+          }
+
+          // Changes the comparison ignores, logged so a CI-only difference can be traced to its field.
+          function ignoredDifferences(before, after) {
+            const notes = [];
+            const raw = pr => JSON.stringify(pr.labels || []);
+            if (raw(before) !== raw(after)) {
+              const keys = pr => [...new Set((pr.labels || []).flatMap(Object.keys))].sort((a, b) => a.localeCompare(b)).join(',');
+              const names = pr => (pr.labels || []).map(label => label.name).join(',');
+              notes.push(`label JSON differs: names [${names(before)}] -> [${names(after)}], keys [${keys(before)}] -> [${keys(after)}]`);
+            }
+            return notes;
+          }
+
+          function audit(repository, number, expectedHead, api, log = () => {}) {
             if (!/^wiselead-solutions\/[A-Za-z0-9_.-]+$/.test(repository) || !/^[1-9]\d*$/.test(number)) throw Error('Invalid repository or PR number.');
+            // A PR whose labels change mid-audit is audited again from scratch once; the verdict always
+            // comes from a pass whose PR state was identical before and after it, or the audit throws.
+            // Any other change (head, base, body, state, draft, files) throws at once: the workflow checked
+            // the body's sections and issue link before this audit, so only a fresh sweep re-runs them.
+            for (let attempt = 1; ; attempt++) {
+              const { result, before, after } = auditOnce(repository, number, expectedHead, api);
+              for (const note of ignoredDifferences(before, after)) log(`PR #${number} attempt ${attempt}: ignored ${note}`);
+              const changed = changedFields(before, after);
+              if (changed.length === 0) return result;
+              log(`PR #${number} attempt ${attempt}: changed during audit: ${changed.join('; ')}`);
+              if (attempt >= 2 || changed.some(field => !field.startsWith('labels '))) throw Error(`PR changed during documentation audit (${changed.join('; ')}); re-evaluate before merging.`);
+            }
+          }
+
+          function auditOnce(repository, number, expectedHead, api) {
             const prefix = `repos/${repository}`;
             const before = api(`${prefix}/pulls/${number}`);
             if (before.state !== 'open' || before.draft || !/^[0-9a-f]{40}$/.test(before.head?.sha || '')) throw Error('PR is closed, draft, or its head is unreadable.');
-            if ((before.labels || []).some(label => label.name?.toLowerCase() === 'guardian:skip')) throw Error('PR acquired guardian:skip; do not merge.');
+            if ((before.labels || []).some(label => ['guardian:skip', 'hold', 'blocked:owner', 'paused-hold'].includes(label.name?.toLowerCase()))) throw Error('PR acquired guardian:skip or another explicit hold; do not merge.');
+            if (process.env.DOCUMENTATION_EXPECTED_METADATA) {
+              const expectedMetadata = JSON.parse(process.env.DOCUMENTATION_EXPECTED_METADATA);
+              if (Array.isArray(expectedMetadata.assignees)) expectedMetadata.assignees.sort();
+              const observedMetadata = { body: digest(before.body), base: before.base?.ref,
+                assignees: (before.assignees || []).map(user => user.login).sort(),
+                reviewers: (before.requested_reviewers || []).length + (before.requested_teams || []).length };
+              if (canonical(expectedMetadata) !== canonical(observedMetadata)) throw Error('PR metadata changed since the workflow audited its gates.');
+            }
             if (expectedHead && expectedHead !== before.head.sha) throw Error('PR head changed since CI was audited.');
             const files = [];
             for (let page = 1; page <= 30; page++) {
@@ -236,29 +383,30 @@ jobs:
             }
             if (files.length !== before.changed_files || files.length === 0) throw Error('Changed-file inventory is empty or truncated.');
             const cache = new Map();
-            const readDocument = path => {
-              if (cache.has(path)) return cache.get(path);
+            const readAt = (path, ref) => {
+              const key = ref + ':' + path;
+              if (cache.has(key)) return cache.get(key);
               const encoded = path.split('/').map(encodeURIComponent).join('/');
-              const file = api(`${prefix}/contents/${encoded}?ref=${before.head.sha}`);
+              const file = api(`${prefix}/contents/${encoded}?ref=${ref}`);
               if (file.type !== 'file' || file.encoding !== 'base64' || typeof file.content !== 'string') throw Error('Not a readable text file.');
               const text = Buffer.from(file.content, 'base64').toString('utf8');
-              cache.set(path, text); return text;
+              cache.set(key, text); return text;
             };
+            const readDocument = path => readAt(path, before.head.sha);
             const manifest = JSON.parse(readDocument(MANIFEST));
-            const result = validate({ manifest, files, body: before.body, readDocument, repository });
-            const after = api(`${prefix}/pulls/${number}`);
-            if (after.head?.sha !== before.head.sha || after.base?.sha !== before.base?.sha ||
-                digest(after.body) !== digest(before.body) || after.state !== 'open' || after.draft ||
-                after.changed_files !== before.changed_files ||
-                JSON.stringify(after.labels || []) !== JSON.stringify(before.labels || [])) {
-              throw Error('PR changed during documentation audit; re-evaluate before merging.');
+            // A missing or unreadable base manifest leaves baseManifest null, which fails closed.
+            let baseManifest = null;
+            if (/^[0-9a-f]{40}$/.test(before.base?.sha || '')) {
+              try { baseManifest = JSON.parse(readAt(MANIFEST, before.base.sha)); } catch { baseManifest = null; }
             }
-            return { ...result, head: before.head.sha };
+            const result = validate({ manifest, baseManifest, files, body: before.body, readDocument, repository, automation: typeof isAutomationPr === 'function' && isAutomationPr(before, repository) });
+            const after = api(`${prefix}/pulls/${number}`);
+            return { result: { ...result, head: before.head.sha }, before, after };
           }
-          
+
           module.exports = { AREAS, validate, audit, documentationOnly };
           if (require.main === module) {
-            let repository, number, ghPath;
+            let repository, number, ghPath, audited = false;
             const executable = name => {
               const value = process.env[name];
               if (!value || !isAbsolute(value)) throw Error(`Trusted workflow must supply absolute ${name}.`);
@@ -277,19 +425,36 @@ jobs:
               const matchIndex = args.indexOf('--match-head-commit');
               let expected = args[1];
               if (mode === '--merge') expected = matchIndex >= 0 ? args[matchIndex + 1] : '';
-              const result = audit(repo, number, expected, api);
+              // The guardian keeps these lines out of the block reasons and echoes them to its log.
+              const log = line => process.stderr.write(`Documentation audit diagnostic: ${line}\n`);
+              const result = audit(repo, number, expected, api, log);
               if (!result.ok) throw Error(result.reasons.join('\n'));
+              audited = true;
               if (mode === '--verify') {
                 process.stdout.write(JSON.stringify(result));
               } else if (mode === '--merge') {
-                // The guardian must make the merge decision now, not arm a future unchecked merge.
-                const mergeArgs = args.filter(arg => arg !== '--auto');
-                if (matchIndex < 0) mergeArgs.push('--match-head-commit', result.head);
-                if (!mergeArgs.includes('--repo')) mergeArgs.push('--repo', repo);
-                process.stdout.write(execFileSync(ghPath, ['pr', 'merge', ...mergeArgs], {
-                  encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
+                // REST merge is synchronous: it refuses queue-only policies rather than arming auto-merge.
+                const method = ['squash', 'rebase', 'merge'].find(value => args.includes('--' + value));
+                if (!method) throw Error('An explicit supported merge method is required.');
+                const mergeToken = process.env.GUARDIAN_MERGE_TOKEN;
+                const options = { encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
                   stdio: ['ignore', 'pipe', 'pipe'],
-                }));
+                  env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env };
+                let merged;
+                try {
+                  merged = JSON.parse(execFileSync(ghPath, ['api', `repos/${repo}/pulls/${number}/merge`,
+                    '--method', 'PUT', '-f', `sha=${result.head}`, '-f', `merge_method=${method}`], options));
+                  if (merged.merged !== true) throw Error(merged.message || 'GitHub refused the immediate merge.');
+                } catch (mergeError) {
+                  // A response can be lost after the server commits the merge. Confirm before reporting refusal.
+                  let observed;
+                  try { observed = api(`repos/${repo}/pulls/${number}`); } catch { throw mergeError; }
+                  if (observed.merged !== true || observed.head?.sha !== result.head) throw mergeError;
+                  log('Server confirmed the audited head merged after an ambiguous API result.');
+                  merged = { merged: true, sha: observed.merge_commit_sha, message: 'Confirmed merged state' };
+                }
+                // Branch cleanup is intentionally separate from merge; repository auto-delete may perform it.
+                process.stdout.write(JSON.stringify(merged));
               } else {
                 const [command, ...commandArgs] = args.slice(2);
                 // Used only for Shakad's existing trusted merge-method fallback script.
@@ -300,17 +465,20 @@ jobs:
                 }));
               }
             } catch (error) {
-              // Best-effort disarm and label; their failures must never turn the gate green.
+              // Best-effort disarm and label; their failures must never turn the gate green. Only a
+              // failed audit is labelled here: a refused merge command after a passing audit (conflict,
+              // workflow permission, policy) is the guardian workflow's to classify and record.
               if (ghPath && /^wiselead-solutions\/[A-Za-z0-9_.-]+$/.test(repository || '') && /^[1-9]\d*$/.test(number || '')) {
                 for (const args of [
                   ['pr', 'merge', number, '--repo', repository, '--disable-auto'],
-                  ['api', '--method', 'POST', `repos/${repository}/issues/${number}/labels`, '-f', 'labels[]=guardian:blocked'],
+                  ...(audited ? [] : [['api', '--method', 'POST', `repos/${repository}/issues/${number}/labels`, '-f', 'labels[]=guardian:blocked']]),
                 ]) {
                   try { execFileSync(ghPath, args, {timeout:30000,stdio:['ignore','ignore','ignore']}); } catch {}
                 }
               }
-              const detail = error.stderr ? error.stderr.toString() : error.message;
-              process.stderr.write('Documentation baseline / merge blocked:\n' + detail.slice(0, 4000) + '\n');
+              // A failing helper reports on stdout as well as stderr; keep both for the caller's matching.
+              const detail = [error.stdout, error.stderr].filter(Boolean).map(String).join('\n').trim() || error.message;
+              process.stderr.write((audited ? 'Guardian merge refused:\n' : 'Documentation baseline audit rejected:\n') + detail.slice(0, 4000) + '\n');
               process.exitCode = 1;
             }
           }
@@ -319,23 +487,12 @@ jobs:
           "DOCUMENTATION_VALIDATOR_PATH=$documentationValidatorPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $documentationGh = Get-Command gh -CommandType Application -ErrorAction Stop | Select-Object -First 1
           "DOCUMENTATION_GH_PATH=$($documentationGh.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          if ($env:GITHUB_REPOSITORY -eq 'wiselead-solutions/shakad') {
-            $documentationBash = Get-Command bash -CommandType Application -ErrorAction Stop | Select-Object -First 1
-            "DOCUMENTATION_BASH_PATH=$($documentationBash.Source)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
 
-      # A PR that changes .github/workflows/* cannot be merged (or have its branch updated) by
-      # GITHUB_TOKEN once main has moved: GitHub refuses it for want of the `workflows`
-      # permission, which `permissions:` cannot grant. The wiselead-release-bot App has
-      # `workflows: write`, so the audit step uses this token for the merge and update-branch
-      # calls of THOSE PRs only (ai-org#264, as core-platform's guardian does); every read,
-      # review and label stays on GITHUB_TOKEN. Fail-safe: no App id, a missing key or a
-      # failed mint leaves the output empty and the audit falls back to GITHUB_TOKEN.
       - name: Mint release-bot token (workflow-touching merges)
         id: release-bot
         if: ${{ vars.RELEASE_BOT_APP_ID != '' }}
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
@@ -343,38 +500,33 @@ jobs:
           permission-pull-requests: write
           permission-workflows: write
 
-      - name: Audit all open PRs
-        shell: pwsh
+      - name: Verify shared guardian policy
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -Command ". '{0}'"
+        run: |
+          node --test --test-name-pattern='guardian shared|guardian wrapper' .github/scripts/documentation-baseline.test.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Shared Guardian policy verification failed' }
+
+      - name: Audit all PRs
+        id: audit
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -Command ". '{0}'"
         env:
           GH_TOKEN: ${{ github.token }}
           GUARDIAN_WORKFLOW_TOKEN: ${{ steps.release-bot.outputs.token }}
         run: |
+          # guardian-standard:audit:start
           $ErrorActionPreference = 'Stop'
-          $repo = $env:GITHUB_REPOSITORY
+          $PSNativeCommandUseErrorActionPreference = $false
 
-          gh label create 'guardian:blocked' --repo $repo --color 'b60205' --description 'PR Guardian: not ready to merge' --force
-          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not ensure guardian:blocked exists" }
-          gh label create 'guardian:skip' --repo $repo --color 'ededed' --description 'PR Guardian: skip this PR entirely' --force
-          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::could not ensure guardian:skip exists" }
+          $merged = $false
+          $mergeAttempted = $false
+          $appMerged = $false
+          $tokenMerged = $false
 
-          # The canonical org five. See AGENTS.md.
-          $requiredSections = @(
-            'Executive Summary',
-            'Technical Summary',
-            'Testing',
-            'Risk & Rollout',
-            'Reviewer Guidance'
-          )
-
-          # Every state-changing gh call goes through this. What it replaces was a bare
-          # `gh ...` followed by a `::warning::` on $LASTEXITCODE, which logged a refused
-          # call but never failed the run - so a guardian that could not record its
-          # verdict still ended green.
-          #
-          # Failures accumulate rather than throwing at the point of failure, so one PR
-          # that cannot be labelled, reviewed or merged does not abandon the rest of the
-          # sweep. The run still fails at the end - a guardian that could not record its
-          # verdict must not report success (core-platform's pr-guardian.yml, same helper).
+          $PRS_JSON = gh pr list --state open --limit 1000 --json 'number,title,body,isDraft,assignees,reviewRequests,labels,headRefName,baseRefName,headRefOid,author,autoMergeRequest'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gh pr list failed (exit $LASTEXITCODE) -- failing the audit rather than treating it as zero open PRs."
+            exit 1
+          }
           $ghFailures = @()
 
           function Invoke-Gh {
@@ -382,10 +534,6 @@ jobs:
               [Parameter(Mandatory)][string[]] $GhArgs,
               [Parameter(Mandatory)][string]   $What,
               [Parameter(Mandatory)][int]      $Number,
-              # A regex matched against gh's combined output on failure. A match means the
-              # call failed only because the desired end state already holds (e.g. removing
-              # a label the PR does not carry) - a benign race, not a verdict the guardian
-              # failed to record, so it does not count toward $ghFailures.
               [string] $BenignIfMatches
             )
             $out = & gh @GhArgs 2>&1
@@ -393,341 +541,367 @@ jobs:
               $outText = $out | Out-String
               if ($BenignIfMatches -and $outText -match $BenignIfMatches) {
                 Write-Host "PR #${Number}: $What was already satisfied (gh exited $LASTEXITCODE) - treating as done"
-                $global:LASTEXITCODE = 0
                 return $true
               }
               $script:ghFailures += "PR #${Number}: could not $What (gh exited $LASTEXITCODE)"
               Write-Host "::error title=Guardian action failed::PR #${Number} - could not $What (gh exited $LASTEXITCODE)"
               if ($out) { Write-Host $outText }
-              $global:LASTEXITCODE = 0
               return $false
             }
             return $true
           }
 
-          # ai-org#264: bring a stale workflow-touching PR up to date. GITHUB_TOKEN is
-          # refused for it (no `workflows` permission), so the release-bot App token is used
-          # when the mint step produced one. A failure is the PR's own state, not a guardian
-          # malfunction: it is logged here and the caller labels the PR instead of failing
-          # the sweep. REST rather than `gh pr update-branch`: the self-hosted runner's gh 2.46
-          # has no such subcommand.
-          function Update-WorkflowPrBranch([int]$PrNumber) {
-            $guardianToken = $env:GH_TOKEN
-            if ($env:GUARDIAN_WORKFLOW_TOKEN) { $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN }
-            try { $updateOut = & gh api -X PUT "repos/$repo/pulls/$PrNumber/update-branch" 2>&1 } finally { $env:GH_TOKEN = $guardianToken }
-            $updateExit = $LASTEXITCODE
-            $global:LASTEXITCODE = 0
-            if ($updateExit -eq 0) { return $true }
-            Write-Host "PR #$PrNumber update-branch failed (gh exited $updateExit): $($updateOut | Out-String)"
-            return $false
-          }
-
           function Test-GuardianVerdictChanged([int]$PrNumber, [string]$Verdict) {
-            $encodedBodies = gh api --paginate "repos/$repo/pulls/$PrNumber/reviews?per_page=100" `
-              --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("PR Guardian")) | .body | @base64' 2>$null
-            if ($LASTEXITCODE -ne 0) { throw "Could not read prior Guardian reviews for PR #$PrNumber" }
-            $lastEncoded = @($encodedBodies | Where-Object { $_ } | Select-Object -Last 1)
-            if ($lastEncoded.Count -eq 0) { return $true }
-            $lastVerdict = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lastEncoded[0]))
-            return $lastVerdict -cne $Verdict
+            $prior = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/pulls/$PrNumber/reviews?per_page=100" --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("PR Guardian")) | .body | @base64')
+            if ($LASTEXITCODE -ne 0) {
+              $script:ghFailures += "PR #${PrNumber}: could not read prior Guardian reviews"
+              return $true
+            }
+            if ($prior.Count -eq 0) { return $true }
+            return $prior[-1] -cne [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Verdict))
           }
-          # Exactly one space between keyword and target.
-          $issueLink = '(?m)\b(Closes|Fixes|Resolves|Part of) ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#|#)\d+\b'
 
-          # Read ONCE per run, before the loop (ai-org#207 W2). The default branch
-          # decides the merge method and the base-branch rule below.
-          $defaultBranch = gh repo view $repo --json defaultBranchRef --jq .defaultBranchRef.name
-          if ($LASTEXITCODE -ne 0 -or -not $defaultBranch) { throw "could not read the default branch of $repo" }
-
-          # Base-branch rule: in a repo with a develop branch, only develop, release/*
-          # and hotfix/* may target the default branch (ai-org docs/WAYS-OF-WORKING.md).
-          # A 404 means no develop, so the rule is off; any other failure is a guardian
-          # malfunction and throws like the gh pr list failure below.
-          $developOut = gh api "repos/$repo/branches/develop" 2>&1
-          if ($LASTEXITCODE -eq 0) {
-            $hasDevelop = $true
-            Write-Host "Base-branch rule on: $repo has develop; only develop, release/* and hotfix/* may target $defaultBranch"
-          } elseif (($developOut | Out-String) -match 'HTTP 404') {
-            $hasDevelop = $false
-            Write-Host "Base-branch rule skipped: $repo has no develop branch"
-          } else {
-            throw "could not check whether $repo has a develop branch: $($developOut | Out-String)"
-          }
-          $global:LASTEXITCODE = 0
-
-          # Records a blocked verdict on ONE PR: a COMMENT review plus the
-          # guardian:blocked label. Shared by the audit and the merge call, so a PR
-          # found to conflict only at merge time is told so on its own thread in the
-          # same shape as any other block.
-          function Set-GuardianBlocked([int]$PrNumber, [string[]]$Reasons) {
-            $comment = "**PR Guardian - blocked**`n`nThis PR is not ready to merge until the following are resolved:`n" `
-              + ($Reasons -join "`n") `
-              + "`n`nPush a fix, or edit the PR body, and the guardian re-evaluates automatically (every 15 minutes, or on the next PR event)."
-            if (Test-GuardianVerdictChanged $PrNumber $comment) {
-              [void](Invoke-Gh @('pr', 'review', "$PrNumber", '--repo', $repo, '--comment', '--body', $comment) 'post the blocked verdict' $PrNumber)
-            } else { Write-Host "PR #$PrNumber verdict unchanged; not posting a duplicate review" }
-            # REST, not `gh pr edit`: that queries the retired Projects Classic
-            # GraphQL field on the fleet's gh version and fails.
-            [void](Invoke-Gh @('api', '--method', 'POST', "repos/$repo/issues/$PrNumber/labels",
+          function Set-GuardianBlocked([int]$PrNumber, [string]$Reasons) {
+            $comment = "❌ **PR Guardian — Blocked**`n`nThis PR cannot merge until the following are resolved:`n$Reasons`n`nPush a fix and the guardian will re-evaluate automatically."
+            if (Test-GuardianVerdictChanged $PrNumber $comment) { [void](Invoke-Gh @('pr', 'review', "$PrNumber", '--request-changes', '--body', $comment) 'post the blocked verdict' $PrNumber) } else { Write-Host "PR #$PrNumber verdict unchanged - not re-posting" }
+            [void](Invoke-Gh @('api', '--method', 'POST', "repos/$env:GITHUB_REPOSITORY/issues/$PrNumber/labels",
                                '-f', 'labels[]=guardian:blocked') 'apply guardian:blocked' $PrNumber)
           }
 
-          # Does any OTHER active workflow in this repo run on pull requests? Read once per
-          # sweep (see header). Anything unreadable counts as "CI expected", which blocks an
-          # empty check list rather than merging through it.
-          $prCiExpected = $false
           try {
-            $wfPaths = @(gh api "repos/$repo/actions/workflows?per_page=100" --jq '.workflows[] | select(.state == "active") | .path')
-            if ($LASTEXITCODE -ne 0) { throw 'could not list workflows' }
-            foreach ($p in $wfPaths) {
-              if (-not $p -or $p -notmatch '^\.github/workflows/' -or $p -match '/pr-guardian\.ya?ml$') { continue }
-              $src = (gh api "repos/$repo/contents/$p" -H 'Accept: application/vnd.github.raw' 2>&1 | Out-String)
-              if ($LASTEXITCODE -ne 0) {
-                # A workflow whose file was deleted stays registered as `active`; skip it.
-                if ($src -match 'HTTP 404') { continue }
-                throw "could not read $p"
-              }
-              if ($src -match '(?m)^[^#\n]*\bpull_request(_target)?\b') { $prCiExpected = $true }
-            }
+            $PRS = @($PRS_JSON | ConvertFrom-Json)
           } catch {
-            Write-Host "::warning::$_ - treating PR CI as expected (an empty check list blocks)"
-            $prCiExpected = $true
+            Write-Host "::error::gh pr list returned unparseable JSON -- failing the audit rather than treating it as zero open PRs."
+            exit 1
           }
-          $global:LASTEXITCODE = 0
-          Write-Host "PR CI expected in ${repo}: $prCiExpected"
 
-          $prsJson = gh pr list --repo $repo --state open --limit 100 --json number,title,body,isDraft,assignees,labels,headRefName,baseRefName
-          if ($LASTEXITCODE -ne 0) { throw "gh pr list failed" }
-          $prs = @($prsJson | ConvertFrom-Json)
-          Write-Host "Auditing $($prs.Count) open PR(s) in $repo"
+          if ($PRS.Count -ge 1000) { throw 'PR inventory reached its safety limit; refusing a partial sweep.' }
 
-          foreach ($pr in $prs) {
-            $num = $pr.number
-            $body = if ($pr.body) { $pr.body } else { '' }
-            $labels = @($pr.labels | ForEach-Object { $_.name })
-            Write-Host "--- PR #$num : $($pr.title)"
+          $ciExpected = $true
+          try {
+            $workflowFiles = @(Get-ChildItem -LiteralPath '.github/workflows' -File -ErrorAction Stop | Where-Object { $_.Extension -in '.yml', '.yaml' -and $_.Name -ne 'pr-guardian.yml' })
+            $ciExpected = @($workflowFiles | Where-Object {
+              $source = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
+              $source -match '\bpull_request(?:_target)?\b' -or $source -notmatch '(?m)^["'']?on["'']?\s*:'
+            }).Count -gt 0
+          } catch { $ciExpected = $true }
+          $reviewerGateApplies = $false
+          if ($env:GUARDIAN_REQUIRE_REVIEWER -eq 'true') {
+            $collaborators = gh api "repos/$env:GITHUB_REPOSITORY/collaborators?per_page=100" --jq 'length'
+            $reviewerGateApplies = $LASTEXITCODE -ne 0 -or "$collaborators" -notmatch '^\d+$' -or [int]$collaborators -gt 1
+          }
 
-            if ($labels -icontains 'guardian:skip') {
-              Write-Host "PR #$num skipped (guardian:skip)"
+          foreach ($pr in $PRS) {
+            $NUM = $pr.number
+            $failuresBefore = $ghFailures.Count
+            $env:DOCUMENTATION_EXPECTED_METADATA = @{
+              body = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes([string]$pr.body))).ToLowerInvariant()
+              base = [string]$pr.baseRefName
+              assignees = @($pr.assignees.login | Sort-Object)
+              reviewers = @($pr.reviewRequests).Count
+            } | ConvertTo-Json -Compress -Depth 10
+            $BODY = if ($null -ne $pr.body) { [string]$pr.body } else { '' }
+            foreach ($pass in 1..2) {
+              $BODY = $BODY -replace '&amp;', '&' -replace '&lt;', '<' -replace '&gt;', '>' -replace '&#39;', "'" -replace '&quot;', '"' -replace '&#34;', '"'
+            }
+            $DRAFT = [bool]$pr.isDraft
+            $ASSIGNEES = @($pr.assignees).Count
+            $LABELS = (@($pr.labels) | ForEach-Object { $_.name }) -join ','
+            $HEAD_REF = [string]$pr.headRefName
+            $BASE_REF = [string]$pr.baseRefName
+            $HEAD_SHA = [string]$pr.headRefOid
+
+            Write-Host "--- PR #$NUM ---"
+
+            $labelNames = @($pr.labels | ForEach-Object { "$($_.name)" })
+            $held = @($labelNames | Where-Object { $_ -iin @('guardian:skip', 'hold', 'blocked:owner', 'paused-hold') }).Count -gt 0
+            if ($null -ne $pr.autoMergeRequest) {
+              if (-not (Invoke-Gh @('pr', 'merge', "$NUM", '--disable-auto') 'disable legacy auto-merge' $NUM)) { continue }
+            }
+            if ($held -and $env:GUARDIAN_AUDIT_HELD -ne 'true') {
+              Write-Host "PR #$NUM skipped (explicit hold)"
               continue
             }
 
-            $isDependabot = $pr.headRefName -like 'dependabot/*'
-            $blockReasons = @()
+            $IS_DEPENDABOT = $HEAD_REF -like 'dependabot/*' -and $pr.author.login -in @('app/dependabot', 'dependabot[bot]')
+            $metadataExempt = $IS_DEPENDABOT -or ($env:GUARDIAN_RELEASE_METADATA_EXEMPT -eq 'true' -and ($HEAD_REF -eq 'develop' -or $HEAD_REF -like 'backmerge/*'))
 
-            if ($pr.isDraft) { $blockReasons += '- PR is still a draft' }
+            $BLOCK_REASON = ''
 
-            if (-not $isDependabot) {
-              if ($pr.assignees.Count -eq 0) { $blockReasons += '- No assignee set' }
-              foreach ($section in $requiredSections) {
-                if ($body -notmatch [regex]::Escape($section)) {
-                  $blockReasons += "- Missing PR body section: $section"
+            if ($DRAFT) { $BLOCK_REASON += "`n- PR is still a draft" }
+
+            if (-not $metadataExempt) {
+              if ($ASSIGNEES -eq 0) { $BLOCK_REASON += "`n- No assignee set" }
+
+              if ($reviewerGateApplies -and @($pr.reviewRequests).Count -eq 0) { $BLOCK_REASON += "`n- No reviewer requested" }
+
+              foreach ($section in 'Executive Summary', 'Technical Summary', 'Testing', 'Risk & Rollout', 'Reviewer Guidance') {
+                if ($BODY -notmatch [regex]::Escape($section)) {
+                  $BLOCK_REASON += "`n- Missing PR section: $section"
                 }
               }
-              if ($body -notmatch $issueLink) {
-                $blockReasons += '- No issue link. Use `Closes #N`, `Fixes #N`, `Resolves #N` or `Part of #N`.'
+
+              if ($BODY -notmatch '(Closes|Fixes|Resolves|Part[ -]of) ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#|#)[0-9]') {
+                $BLOCK_REASON += "`n- Missing issue link (Closes #, Fixes #, Resolves #, or Part of #)"
               }
             }
 
-            # CI state via statusCheckRollup, not `gh pr checks` text output -
-            # see header. Fails closed (owner, 2026-10-04): only checks that have
-            # COMPLETED as success/neutral/skipped pass; anything queued, in
-            # progress, pending, failed or unreadable blocks. Excludes every run of
-            # this workflow (by workflow name), or the guardian blocks on itself
-            # forever.
-            $rollupJson = gh pr view $num --repo $repo --json 'statusCheckRollup,headRefOid'
-            # The commit this CI verdict belongs to, read in the SAME call: the merge is bound to it.
+            # ci-gate:start
+            $SELF_RUNS = @()
+            $SELF_RUNS_JSON = gh api "repos/$($env:GITHUB_REPOSITORY)/actions/workflows/pr-guardian.yml/runs?head_sha=$HEAD_SHA&per_page=100" --jq '[.workflow_runs[].id | tostring]'
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($SELF_RUNS_JSON)) {
+              try { $SELF_RUNS = @($SELF_RUNS_JSON | ConvertFrom-Json) } catch { $SELF_RUNS = @() }
+            }
+            $SELF_RUNS = @($SELF_RUNS + [string]$env:GITHUB_RUN_ID | Select-Object -Unique)
+
+            $CI_RAW = gh pr view $NUM --json 'statusCheckRollup,headRefOid'
             $auditedHead = ''
-            if ($LASTEXITCODE -eq 0 -and $rollupJson) { try { $auditedHead = "$(($rollupJson | ConvertFrom-Json).headRefOid)" } catch { $auditedHead = '' } }
-            $ciReadOk = ($LASTEXITCODE -eq 0)
-            $global:LASTEXITCODE = 0
-
-            $checks = @()
-            if ($ciReadOk) {
+            if ($LASTEXITCODE -eq 0 -and $CI_RAW) { try { $auditedHead = "$(($CI_RAW | ConvertFrom-Json).headRefOid)" } catch { $auditedHead = '' } }
+            $CI_CHECKS = @()
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($CI_RAW)) {
               try {
-                $allChecks = @(($rollupJson | ConvertFrom-Json).statusCheckRollup)
-                $checks = @($allChecks | Where-Object { ([string]$_.workflowName).Replace([string][char]0x2014, '-') -ne $env:GITHUB_WORKFLOW.Replace([string][char]0x2014, '-') })
-              } catch { $ciReadOk = $false }
+                $rollup = @(($CI_RAW | ConvertFrom-Json).statusCheckRollup)
+                $CI_CHECKS = @(
+                  $rollup
+                    | Where-Object { $_ }
+                    | Group-Object { if ($_.name) { "$($_.workflowName)/$($_.name)" } else { $_.context } }
+                    | ForEach-Object {
+                        $latest = $_.Group | Sort-Object { if (-not $_.startedAt -and ($_.status -in @('QUEUED','IN_PROGRESS','WAITING','PENDING') -or $_.state -eq 'PENDING')) { [datetime]::MaxValue } else { [datetime]($_.startedAt ?? '1970-01-01T00:00:00Z') } } | Select-Object -Last 1
+                        $state = if ($latest.conclusion) { $latest.conclusion } else { $latest.state }
+                        $bucket =
+                          if (-not $latest.conclusion -and $latest.status -and $latest.status -ne 'COMPLETED') { 'pending' }
+                          else {
+                            switch ($state) {
+                              'SUCCESS'     { 'pass' }
+                              'NEUTRAL'     { 'pass' }
+                              'SKIPPED'     { 'skipping' }
+                              'CANCELLED'   { 'cancel' }
+                              'PENDING'     { 'pending' }
+                              'QUEUED'      { 'pending' }
+                              'IN_PROGRESS' { 'pending' }
+                              'EXPECTED'    { 'pending' }
+                              default       { 'fail' }
+                            }
+                          }
+                        [pscustomobject]@{
+                          name   = $_.Name
+                          bucket = $bucket
+                          link   = if ($latest.detailsUrl) { [string]$latest.detailsUrl } else { '' }
+                        }
+                      }
+                )
+              } catch { $CI_CHECKS = @() }
             }
 
-            if (-not $ciReadOk) {
-              $blockReasons += '- Could not read CI status (treating as not green)'
-            } elseif ($checks.Count -gt 0) {
-              $failed = @()
-              $pending = @()
-              foreach ($check in $checks) {
-                $name = if ($check.name) { $check.name } else { $check.context }
-                if ($check.__typename -ceq 'CheckRun') {
-                  if ($check.status -ne 'COMPLETED') { $pending += $name; continue }
-                  if ($check.conclusion -notin @('SUCCESS', 'NEUTRAL', 'SKIPPED')) { $failed += $name }
-                } else {
-                  if ($check.state -eq 'PENDING') { $pending += $name; continue }
-                  if ($check.state -ne 'SUCCESS') { $failed += $name }
+            $CI_OTHER = @($CI_CHECKS | Where-Object {
+              $link = if ($null -ne $_.link) { [string]$_.link } else { '' }
+              $m = [regex]::Match($link, '/actions/runs/(?<id>[0-9]+)/')
+              $rid = if ($m.Success) { $m.Groups['id'].Value } else { '' }
+              $SELF_RUNS -notcontains $rid
+            })
+
+            if (@($CI_OTHER | Where-Object { $_.bucket -eq 'fail' -or $_.bucket -eq 'cancel' }).Count -gt 0) {
+              $BLOCK_REASON += "`n- CI checks are failing"
+            }
+            if (($ciExpected -and $CI_OTHER.Count -eq 0) -or @($CI_OTHER | Where-Object { $_.bucket -eq 'pending' }).Count -gt 0) {
+              $BLOCK_REASON += "`n- CI checks have not finished yet"
+            }
+            if (-not $auditedHead -or $auditedHead -cne $HEAD_SHA) { $BLOCK_REASON += "`n- CI head is unreadable or changed during audit" }
+            # ci-gate:end
+
+            $MERGEABLE = 'UNKNOWN'
+            $MERGE_INFO = gh pr view $NUM --json mergeable
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($MERGE_INFO)) {
+              try { $m = ($MERGE_INFO | ConvertFrom-Json).mergeable; if ($m) { $MERGEABLE = [string]$m } } catch { }
+            } else {
+              Write-Host "PR #${NUM}: could not read mergeable state, auditing without it"
+            }
+            Write-Host "PR #$NUM mergeable = $MERGEABLE (base $BASE_REF)"
+            $CONFLICT_REASON = "`n- Branch conflicts with $BASE_REF and cannot be merged (rebase onto $BASE_REF, or merge it in, and push)"
+            if ($MERGEABLE -eq 'CONFLICTING') { $BLOCK_REASON += $CONFLICT_REASON }
+
+            if (-not $BLOCK_REASON -and -not $held) {
+              $docPreference = $ErrorActionPreference
+              $ErrorActionPreference = 'Continue'
+              try {
+                $docOut = @(& node $env:DOCUMENTATION_VALIDATOR_PATH --verify $env:GITHUB_REPOSITORY "$NUM" "$auditedHead" 2>&1 | ForEach-Object { "$_" })
+                $docCode = $LASTEXITCODE
+              } finally { $ErrorActionPreference = $docPreference }
+              $global:LASTEXITCODE = 0
+              $docOut | Where-Object { "$_" -match '^Documentation audit diagnostic:' } | ForEach-Object { Write-Host "$_" }
+              if ($docCode -ne 0) {
+                $docReasons = @($docOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and $_ -notmatch '^Documentation baseline / merge blocked:' -and $_ -notmatch '^Documentation audit diagnostic:' -and $_ -notmatch '^\{' })
+                if ($docReasons.Count -eq 0) { $docReasons = @('the validator failed without a reason; the next run re-audits it') }
+                Write-Host "PR #$NUM documentation baseline blocked: $($docReasons -join ' | ')"
+                foreach ($docReason in $docReasons) { $BLOCK_REASON += "`n- Documentation baseline: $docReason" }
+              }
+            }
+
+            if (-not $BLOCK_REASON -and -not $held -and $env:GUARDIAN_STALE_BASE_THRESHOLD -match '^[1-9]\d*$') {
+              $behind = gh api "repos/$env:GITHUB_REPOSITORY/compare/$BASE_REF...$HEAD_SHA" --jq '.behind_by // empty'
+              if ($LASTEXITCODE -ne 0 -or "$behind" -notmatch '^\d+$') { $BLOCK_REASON += "`n- Could not verify merge base freshness" }
+              elseif ([int]$behind -gt [int]$env:GUARDIAN_STALE_BASE_THRESHOLD) { $BLOCK_REASON += "`n- Branch is $behind commits behind $BASE_REF; update the branch and re-run CI" }
+            }
+
+            if ($BLOCK_REASON) {
+              Write-Host "PR #$NUM BLOCKED"
+              Set-GuardianBlocked $NUM $BLOCK_REASON
+            } else {
+              Write-Host "PR #$NUM PASSED"
+              $COMMENT = if ($held) { '✅ **PR Guardian** — metadata and CI pass; merge withheld by explicit hold. Documentation is re-audited after the hold is removed.' }
+                elseif ($merged) { '✅ **PR Guardian** — every gate this repo requires is now satisfied; merge deferred to the next sweep.' }
+                else { '✅ **PR Guardian** — every gate this repo requires is now satisfied; ready, and merging.' }
+              if (Test-GuardianVerdictChanged $NUM $COMMENT) { [void](Invoke-Gh @('pr', 'review', "$NUM", '--comment', '--body', $COMMENT) 'post the pass verdict' $NUM) } else { Write-Host "PR #$NUM verdict unchanged - not re-posting" }
+
+              $reviewIdsErrFile = New-TemporaryFile
+              $REVIEW_IDS_RAW = (gh api --paginate "repos/$env:GITHUB_REPOSITORY/pulls/$NUM/reviews?per_page=100" --jq '.[] | select(.user.login=="github-actions[bot]" and .state=="CHANGES_REQUESTED" and (.body // "" | contains("PR Guardian"))) | .id' 2>$reviewIdsErrFile | Out-String)
+              $reviewIdsExit = $LASTEXITCODE
+              if ($reviewIdsExit -ne 0) {
+                $reviewIdsErr = (Get-Content -Path $reviewIdsErrFile -Raw -ErrorAction SilentlyContinue)
+                Write-Host "PR #$NUM -- could not read reviews to dismiss: $($reviewIdsErr)"
+                $ghFailures += "PR #${NUM}: could not list reviews to dismiss (gh exited $reviewIdsExit)"
+                Remove-Item -Path $reviewIdsErrFile -ErrorAction SilentlyContinue
+              } else {
+                Remove-Item -Path $reviewIdsErrFile -ErrorAction SilentlyContinue
+                $REVIEW_IDS = @($REVIEW_IDS_RAW -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                foreach ($ID in $REVIEW_IDS) {
+                  $DISMISS_OUT = (gh api --method PUT "repos/$env:GITHUB_REPOSITORY/pulls/$NUM/reviews/$ID/dismissals" -f message='Superseded: PR Guardian re-audited this PR and it now passes.' -f event=DISMISS 2>&1 | Out-String)
+                  if ($LASTEXITCODE -ne 0) {
+                    if ($DISMISS_OUT -match 'Can not dismiss a dismissed pull request review') {
+                      Write-Host "PR #$NUM -- stale review $ID was already dismissed"
+                    } else {
+                      $ghFailures += "PR #${NUM}: could not dismiss stale review $ID (gh exited $LASTEXITCODE)"
+                    }
+                    Write-Host "PR #$NUM -- failed to dismiss stale review $ID`: $($DISMISS_OUT.Trim())"
+                  } else {
+                    Write-Host "PR #$NUM -- dismissed stale guardian review $ID"
+                  }
                 }
               }
-              if ($failed.Count -gt 0) { $blockReasons += "- CI is failing: $($failed -join ', ')" }
-              if ($pending.Count -gt 0) { $blockReasons += "- CI is still running: $($pending -join ', ')" }
-            } elseif ($prCiExpected) {
-              $blockReasons += '- No CI checks have reported yet'
-            }
-            # $checks.Count -eq 0 passes only while no PR workflow exists - see header.
 
-            # Mergeability per PR, read separately so a failed read only costs this
-            # PR its conflict check. GitHub computes it lazily: UNKNOWN means "not
-            # computed yet" and must never read as a conflict.
-            $base = $pr.baseRefName
-            $mergeable = 'UNKNOWN'
-            $mergeableOut = gh pr view $num --repo $repo --json mergeable --jq .mergeable 2>&1
-            if ($LASTEXITCODE -eq 0 -and $mergeableOut) {
-              $mergeable = ($mergeableOut | Out-String).Trim()
-            } else {
-              Write-Host "PR #${num}: could not read mergeable state, auditing without it"
-              Write-Host ($mergeableOut | Out-String)
-            }
-            $global:LASTEXITCODE = 0
-            Write-Host "PR #$num mergeable = $mergeable (base $base)"
-
-            # Same text wherever a conflict is detected, so the verdict does not flap.
-            $conflictReason = "- Branch conflicts with $base and cannot be merged (rebase onto $base, or merge it in, and push)"
-            if ($mergeable -eq 'CONFLICTING') { $blockReasons += $conflictReason }
-
-            $headRef = $pr.headRefName
-            if ($hasDevelop -and $base -eq $defaultBranch -and
-                -not ($headRef -eq 'develop' -or $headRef -like 'release/*' -or $headRef -like 'hotfix/*')) {
-              $blockReasons += "- Base branch is $defaultBranch but head is ${headRef}: only develop, release/* and hotfix/* may target $defaultBranch (retarget this PR to develop)"
-            }
-
-            if ($blockReasons.Count -gt 0) {
-              Write-Host "PR #$num BLOCKED"
-              Set-GuardianBlocked $num $blockReasons
-            } else {
-              Write-Host "PR #$num PASSED"
-              $comment = "**PR Guardian - all checks passed.** Not a draft, assignee set, all five body sections present, issue linked. Merging now."
-              if (Test-GuardianVerdictChanged $num $comment) {
-                [void](Invoke-Gh @('pr', 'review', "$num", '--repo', $repo, '--comment', '--body', $comment) 'post the pass verdict' $num)
-              } else { Write-Host "PR #$num verdict unchanged; not posting a duplicate review" }
-              # REST, not `gh pr edit` - see Set-GuardianBlocked. 404 = label not on the PR.
-              [void](Invoke-Gh @('api', '--method', 'DELETE', "repos/$repo/issues/$num/labels/guardian%3Ablocked") 'clear guardian:blocked' $num `
-                                -BenignIfMatches 'HTTP 404')
-
-              # Merge method keys off the BASE branch. Decided 2026-09-24 (ai-org
-              # docs/WAYS-OF-WORKING.md): base-keyed; head-keying squashed release/* and
-              # hotfix/* into main. Into the default branch -> --merge; anything else
-              # (feature/* into develop) -> --squash.
-              $mergeMethod = if ($base -eq $defaultBranch) { '--merge' } else { '--squash' }
-              # Never delete a long-lived branch: with base-keyed merges a develop -> main PR
-              # would otherwise delete develop. Only feature-style heads are deleted (ai-org#207 W2).
-              $deleteArgs = @(if ("$($pr.headRefName)" -notmatch '^(develop|main)$|^(release|hotfix)/') { '--delete-branch' })
-              # HEAD-BOUND MERGE (2026-10-05). The audit read the PR list, then CI, then
-              # mergeability; a push, a draft flip or a guardian:skip label added meanwhile would
-              # otherwise only be seen by the NEXT run. Re-read those gates (head commit, state,
-              # draft, guardian:skip) right before merging, and bind the merge to the audited commit
-              # with --match-head-commit so GitHub itself refuses it if the head moves after this
-              # read. A skipped merge is never a failure: the next run re-audits the PR from scratch.
-              $nowJson = gh pr view $num --repo $repo --json 'headRefOid,isDraft,state,labels' 2>$null
-              $nowOk = ($LASTEXITCODE -eq 0)
-              $global:LASTEXITCODE = 0
-              $now = $null
-              if ($nowOk -and $nowJson) { try { $now = $nowJson | ConvertFrom-Json } catch { $now = $null } }
-              if (-not $auditedHead -or -not $now) {
-                Write-Host "PR #$num not merged: could not read its audited head or re-read it before merging; the next run re-audits it"
+              if ($held) {
+                [void](Invoke-Gh @('api', '--method', 'DELETE', "repos/$env:GITHUB_REPOSITORY/issues/$NUM/labels/guardian%3Ablocked") 'clear obsolete guardian:blocked on held PR' $NUM -BenignIfMatches 'Label does not exist|Not Found|HTTP 404')
+                Write-Host "PR #$NUM HELD - metadata and CI pass; merge withheld by explicit hold"
                 continue
               }
-              $nowSkip = @($now.labels | ForEach-Object { $_.name }) -icontains 'guardian:skip'
-              if ($now.state -cne 'OPEN' -or $now.isDraft -or "$($now.headRefOid)" -cne $auditedHead -or $nowSkip) {
-                Write-Host "PR #$num not merged: it changed during this audit (head $auditedHead -> $($now.headRefOid), state $($now.state), draft $($now.isDraft), guardian:skip $nowSkip); the next run re-audits it"
-                continue
-              }
-              # ai-org#264: whether this PR changes .github/workflows/*, and whether it is behind
-              # its base. GITHUB_TOKEN cannot merge, or update the branch of, such a PR once
-              # main has moved; the merge and update-branch below use the release-bot App
-              # token (GUARDIAN_WORKFLOW_TOKEN, minted by the step above) for THAT PR only.
-              # An unreadable read leaves both false: the old behaviour.
-              $touchesWorkflows = $false
-              $behindBase = $false
-              $prInfoJson = gh pr view $num --repo $repo --json 'files,mergeStateStatus' 2>$null
-              if ($LASTEXITCODE -eq 0 -and $prInfoJson) {
-                try {
-                  $prInfo = $prInfoJson | ConvertFrom-Json
-                  $touchesWorkflows = @($prInfo.files | Where-Object { $_.path -like '.github/workflows/*' }).Count -gt 0
-                  $behindBase = ("$($prInfo.mergeStateStatus)" -ceq 'BEHIND')
-                } catch { Write-Host "PR #$num could not parse files/mergeStateStatus; merging as a non-workflow PR" }
-              }
-              $global:LASTEXITCODE = 0
-
-              # A workflow-touching PR that is BEHIND is brought up to date BEFORE the merge is
-              # attempted; CI re-runs on the new head and a later sweep merges it. If the update
-              # fails the merge is still tried - GITHUB_TOKEN sometimes manages it.
-              $updateTried = $false
-              if ($touchesWorkflows -and $behindBase) {
-                $updateTried = $true
-                Write-Host "PR #$num changes .github/workflows/ and is behind $base - updating its branch before merging"
-                if (Update-WorkflowPrBranch $num) {
-                  Write-Host "PR #$num branch updated from $base; CI re-runs and a later sweep merges it"
+              if ($ghFailures.Count -gt $failuresBefore) { Write-Host "PR #$NUM not merged: verdict actions failed"; continue }
+              if ($merged -or $mergeAttempted) {
+                Write-Host "PR #$NUM PASSED but already merged one PR this sweep -- leaving it for the next sweep (#2140)."
+              } else {
+                $mergeMethod = if ($BASE_REF -eq $env:GUARDIAN_DEFAULT_BRANCH -and "$($pr.headRefName)" -cmatch '^(release|hotfix|backmerge)/') { '--merge' } else { '--squash' }
+                $ALLOWED = @('merge', 'squash', 'rebase')
+                $ALLOWED_RAW = gh api "repos/$env:GITHUB_REPOSITORY/rules/branches/$BASE_REF" --jq '[.[] | select(.type=="pull_request") | .parameters.allowed_merge_methods // ["merge","squash","rebase"]] | if length==0 then ["merge","squash","rebase"] else reduce .[1:][] as $a (.[0]; [.[] as $x | select(any($a[]; . == $x)) | $x]) end | join(",")'
+                if ($LASTEXITCODE -eq 0 -and "$ALLOWED_RAW".Trim()) {
+                  $ALLOWED = "$ALLOWED_RAW".Trim() -split ','
+                  if ($ALLOWED -notcontains $mergeMethod.TrimStart('-')) {
+                    $fallback = @('squash', 'rebase', 'merge') | Where-Object { $ALLOWED -contains $_ } | Select-Object -First 1
+                    if ($fallback) {
+                      Write-Host "PR #$NUM -- $BASE_REF rules allow [$($ALLOWED -join ',')], not $mergeMethod; using --$fallback"
+                      $mergeMethod = "--$fallback"
+                    }
+                  }
+                } else {
+                  Write-Host "PR #$NUM -- could not read $BASE_REF merge rules; keeping $mergeMethod"
+                }
+                $repoMethods = gh api "repos/$env:GITHUB_REPOSITORY" --jq '[if .allow_squash_merge then "squash" else empty end, if .allow_rebase_merge then "rebase" else empty end, if .allow_merge_commit then "merge" else empty end] | join(",")'
+                if ($LASTEXITCODE -eq 0 -and "$repoMethods" -match '^(merge|squash|rebase)(,(merge|squash|rebase))*$') {
+                  $effectiveMethods = @($ALLOWED | Where-Object { ("$repoMethods" -split ',') -contains $_ })
+                  if ($effectiveMethods -notcontains $mergeMethod.TrimStart('-')) {
+                    $fallback = @('squash', 'rebase', 'merge') | Where-Object { $effectiveMethods -contains $_ } | Select-Object -First 1
+                    if (-not $fallback) { Set-GuardianBlocked $NUM "`n- Repository settings and branch rules allow no common merge method"; continue }
+                    $mergeMethod = "--$fallback"
+                  }
+                }
+                $nowJson = gh pr view $NUM --json 'headRefOid,isDraft,state,labels,body,assignees,reviewRequests,baseRefName'
+                $nowOk = ($LASTEXITCODE -eq 0)
+                $global:LASTEXITCODE = 0
+                $now = $null
+                if ($nowOk -and $nowJson) { try { $now = $nowJson | ConvertFrom-Json } catch { $now = $null } }
+                if (-not $auditedHead -or -not $now) {
+                  Write-Host "PR #$NUM not merged: could not read its audited head or re-read it before merging; the next run re-audits it"
                   continue
                 }
-              }
-
-              $guardianToken = $env:GH_TOKEN
-              if ($touchesWorkflows -and $env:GUARDIAN_WORKFLOW_TOKEN) {
-                Write-Host "PR #$num changes .github/workflows/ - merging under the release-bot App token (ai-org#264)"
-                $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN
-              }
-              try {
-                $mergeOut = node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $num --repo $repo $mergeMethod @deleteArgs --match-head-commit $auditedHead 2>&1
-                $mergeExit = $LASTEXITCODE
-              } finally {
-                $env:GH_TOKEN = $guardianToken
-              }
-              if ($mergeExit -eq 0) {
-                Write-Host "PR #$num merged ($mergeMethod)"
-              } elseif (($mergeOut | Out-String) -match 'not mergeable|merge commit cannot be cleanly created|[Mm]erge conflict') {
-                # A conflict is the PR's own state, not a guardian fault: record the
-                # blocked verdict on that PR (covers a conflict that appeared after the
-                # mergeable read above, or an UNKNOWN read) and carry on.
-                Write-Host "PR #$num conflicts with $base - recording it on the PR"
-                Write-Host ($mergeOut | Out-String)
-                Set-GuardianBlocked $num @($conflictReason)
-              } else {
-                $mergeText = $mergeOut | Out-String
-                $updated = $false
-                if ($touchesWorkflows -and -not $updateTried -and $mergeText -notmatch 'Head branch was modified') {
-                  # ai-org#264: the refusal is most likely the missing `workflows` permission on
-                  # a stale workflow PR. Bring the branch up to date; CI re-runs and a later
-                  # sweep merges it.
-                  Write-Host "PR #$num MERGE REFUSED (gh exited $mergeExit):"
-                  Write-Host $mergeText
-                  $updated = Update-WorkflowPrBranch $num
-                  if ($updated) { Write-Host "PR #$num branch updated from $base; CI re-runs and a later sweep merges it" }
+                $nowSkip = @($now.labels | Where-Object { $_.name -iin @('guardian:skip', 'hold', 'blocked:owner', 'paused-hold') }).Count -gt 0
+                $metadataChanged = $now.body -cne $pr.body -or $now.baseRefName -cne $BASE_REF -or
+                  (@($now.assignees.login | Sort-Object) -join ',') -cne (@($pr.assignees.login | Sort-Object) -join ',') -or
+                  (@($now.reviewRequests | ConvertTo-Json -Compress -Depth 10) -join '') -cne (@($pr.reviewRequests | ConvertTo-Json -Compress -Depth 10) -join '')
+                if ($metadataChanged -or $now.state -cne 'OPEN' -or $now.isDraft -or "$($now.headRefOid)" -cne $auditedHead -or $nowSkip) {
+                  Write-Host "PR #$NUM not merged: it changed during this audit (head $auditedHead -> $($now.headRefOid), state $($now.state), draft $($now.isDraft), guardian:skip $nowSkip); the next run re-audits it"
+                  continue
                 }
-                if ($updated) {
-                  # Nothing to record: the new head is audited from scratch.
-                } elseif ($touchesWorkflows -and $mergeText -match '(?i)workflow') {
-                  # A real workflow-permission refusal: record the state on the PR, do not
-                  # fail the audit. `guardian:needs-human-merge` is a passed-but-unmergeable
-                  # state, not a variant of `guardian:blocked`. REST, as above.
-                  Write-Host "PR #$num MERGE REFUSED (workflow permission) - labelling guardian:needs-human-merge"
-                  [void](Invoke-Gh @('api', '--method', 'POST', "repos/$repo/issues/$num/labels",
-                                     '-f', 'labels[]=guardian:needs-human-merge') 'apply guardian:needs-human-merge' $num)
+                $useBotToken = $false
+                if ($env:GUARDIAN_WORKFLOW_TOKEN) {
+                  $filesJson = (gh pr view $NUM --json files | Out-String)
+                  $prFiles = @()
+                  try { $prFiles = @(($filesJson | ConvertFrom-Json).files | ForEach-Object { "$($_.path)" }) } catch { $prFiles = @() }
+                  if (@($prFiles | Where-Object { $_ -like '.github/workflows/*' }).Count -gt 0) { $useBotToken = $true }
+                }
+                if ($useBotToken) {
+                  Write-Host "PR #$NUM changes .github/workflows/ -- merging under the release-bot App token (ai-org#264)"
+                  $env:GUARDIAN_MERGE_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN
                 } else {
-                  $ghFailures += "PR #${num}: could not merge (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
-                  Write-Host "::error title=Guardian action failed::PR #$num - could not merge (gh exited $mergeExit) - may be already merged, or blocked by GitHub"
-                  Write-Host $mergeText
+                  Remove-Item Env:GUARDIAN_MERGE_TOKEN -ErrorAction SilentlyContinue
+                }
+                $mergeAttempted = $true
+                $MERGE_OUT = (node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $NUM $mergeMethod --match-head-commit $auditedHead 2>&1 | Out-String).Trim()
+                if ($LASTEXITCODE -eq 0) {
+                  $merged = $true
+                  "merged_base=$BASE_REF" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+                  "merged_pr=$NUM" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+                  if ($useBotToken) { $appMerged = $true } else { $tokenMerged = $true }
+                  $MERGE_OUT -split "`n" | Where-Object { $_ -match '^Documentation audit diagnostic:' } | ForEach-Object { Write-Host $_ }
+                  [void](Invoke-Gh @('api', '--method', 'DELETE', "repos/$env:GITHUB_REPOSITORY/issues/$NUM/labels/guardian%3Ablocked") 'clear guardian:blocked' $NUM -BenignIfMatches 'Label does not exist|Not Found|HTTP 404')
+                } else {
+                  Write-Host "PR #$NUM MERGE REFUSED (exit $LASTEXITCODE): $MERGE_OUT"
+                  if ($MERGE_OUT -notmatch 'base branch policy' -and $MERGE_OUT -match 'not mergeable|merge commit cannot be cleanly created|[Mm]erge conflict') {
+                    Write-Host "PR #$NUM conflicts with $BASE_REF -- recording it on the PR"
+                    Set-GuardianBlocked $NUM $CONFLICT_REASON
+                  } elseif ($MERGE_OUT -match 'Head branch was modified') {
+                    Write-Host "PR #$NUM not merged: its head moved after the audit read it; the next sweep re-audits it"
+                  } elseif ($MERGE_OUT -match 'Documentation baseline audit rejected') {
+                  Set-GuardianBlocked $NUM "`n- Merge-time documentation audit refused the PR; see the audit log and re-evaluate its evidence"
+                } elseif ($useBotToken) {
+                    $guardianToken = $env:GH_TOKEN
+                    $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN
+                    $UPDATE_OUT = (gh pr update-branch $NUM 2>&1 | Out-String).Trim()
+                    $updateExit = $LASTEXITCODE
+                    $env:GH_TOKEN = $guardianToken
+                    if ($updateExit -eq 0) {
+                      Write-Host "PR #$NUM branch updated from $BASE_REF under the release-bot App token; CI re-runs and a later sweep merges it"
+                    } else {
+                      Write-Host "PR #$NUM update-branch under the release-bot App token failed: $UPDATE_OUT"
+                      [void](Invoke-Gh @('api', '--method', 'POST', "repos/$env:GITHUB_REPOSITORY/issues/$NUM/labels", '-f', 'labels[]=guardian:blocked') 'apply guardian:blocked' $NUM)
+                    }
+                  } else {
+                    [void](Invoke-Gh @('api', '--method', 'POST', "repos/$env:GITHUB_REPOSITORY/issues/$NUM/labels", '-f', 'labels[]=guardian:blocked') 'apply guardian:blocked' $NUM)
+                  }
                 }
               }
             }
           }
 
-          Write-Host "Audit complete."
-
-          # THIS JOB ALWAYS SUCCEEDS, DELIBERATELY - see dev-hub's pr-guardian.yml
-          # for the full writeup of why a red audit check becomes a permanent
-          # self-inflicted block - EXCEPT when a verdict could not be recorded: a guardian
-          # that cannot post what it decided must not report success. This run's own check
-          # is excluded from every PR's CI read above, so failing here cannot block a PR.
+          if ($appMerged -and -not $tokenMerged) {
+            "app_merged_only=true" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+          }
+          if ($merged) {
+            "merged=true" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+            Write-Host "Guardian merged at least one PR."
+          } else {
+            "merged=false" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
+            Write-Host "No PR merged this run, nothing to deploy."
+          }
           if ($ghFailures.Count -gt 0) {
             Write-Host ''
             foreach ($f in $ghFailures) { Write-Host $f }
-            throw "Guardian could not record its verdict on $($ghFailures.Count) action(s). A guardian that cannot post what it decided must not report success."
+            "gh_failures=$($ghFailures.Count)" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
           }
           exit 0
+          # guardian-standard:audit:end
+
+      - name: Fail if a verdict could not be recorded
+        if: ${{ !cancelled() && steps.audit.outputs.gh_failures != '' }}
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -Command ". '{0}'"
+        env:
+          GH_FAILURES: ${{ steps.audit.outputs.gh_failures }}
+        run: |
+          throw "Guardian could not record its verdict on $env:GH_FAILURES action(s). A guardian that cannot post what it decided must not report success."
