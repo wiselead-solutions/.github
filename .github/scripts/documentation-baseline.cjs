@@ -37,7 +37,11 @@ function documentationOnly(files, repository) {
   const safe = path => POLICY_FILES.has(path) || path === REGRESSION_FILES.get(repository) ||
     /^(?:README|readme|PRD|TRD|DECISIONS|SETUP|TESTING|BOOTSTRAP|HANDOVER|MEMORY|PROJECT-DETAILS)\.md$/.test(path) ||
     /^docs\/(?!.*(?:^|\/)\.\.(?:\/|$)).+\.md$/.test(path);
-  return files.length > 0 && files.every(file => safe(file.filename) &&
+  // Maintaining the enforcement assets is documentation work; deleting or renaming one away
+  // removes the gate itself, so that never rides the bootstrap exemption.
+  const dropsPolicy = file => (file.status === 'removed' && POLICY_FILES.has(file.filename)) ||
+    (Boolean(file.previous_filename) && file.previous_filename !== file.filename && POLICY_FILES.has(file.previous_filename));
+  return files.length > 0 && files.every(file => safe(file.filename) && !dropsPolicy(file) &&
     (!file.previous_filename || safe(file.previous_filename)));
 }
 
@@ -108,9 +112,18 @@ function validateImpact(area, entry, row, changed, reasons) {
 }
 
 function validateArea(area, entry, context) {
-  const { docsOnly, readDocument, rows, changed, reasons } = context;
+  const { docsOnly, readDocument, rows, changed, reasons, baseManifest } = context;
   if (!entry || !['ready', 'pending', 'not_applicable'].includes(entry.status)) {
     reasons.push(`${area}: invalid status; use ready, pending or not_applicable.`); return;
+  }
+  const baseEntry = baseManifest && baseManifest.version === 1 && baseManifest.areas ? baseManifest.areas[area] : null;
+  if (!docsOnly && entry.status !== 'pending' && (!baseEntry || baseEntry.status === 'pending')) {
+    reasons.push(`${area}: base branch manifest is pending or unreadable; land the adoption as a documentation-only PR before implementation.`);
+    return;
+  }
+  if (!docsOnly && entry.status !== 'pending' && canonical(entry) !== canonical(baseEntry)) {
+    reasons.push(`${area}: an implementation PR cannot change this area's manifest entry; land manifest changes as a documentation-only PR.`);
+    return;
   }
   if (entry.status === 'pending') {
     if (!/^https:\/\/github\.com\/wiselead-solutions\/[A-Za-z0-9_.-]+\/issues\/[1-9]\d*$/.test(entry.issue || '')) {
@@ -125,7 +138,7 @@ function validateArea(area, entry, context) {
   if (!docsOnly) validateImpact(area, entry, rows.get(area), changed, reasons);
 }
 
-function validate({ manifest, files, body, readDocument, repository }) {
+function validate({ manifest, baseManifest = manifest, files, body, readDocument, repository }) {
   const reasons = [];
   const docsOnly = documentationOnly(files, repository);
   if (!manifest || manifest.version !== 1 || !manifest.areas ||
@@ -134,7 +147,7 @@ function validate({ manifest, files, body, readDocument, repository }) {
   }
   const changed = new Set(files.filter(f => f.status !== 'removed').map(f => f.filename));
   const rows = impactRows(body, reasons);
-  const context = { docsOnly, readDocument, rows, changed, reasons };
+  const context = { docsOnly, readDocument, rows, changed, reasons, baseManifest };
   for (const area of AREAS) validateArea(area, manifest.areas[area], context);
   return { ok: reasons.length === 0, reasons, documentationOnly: docsOnly };
 }

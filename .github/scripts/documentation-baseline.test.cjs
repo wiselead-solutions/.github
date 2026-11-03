@@ -349,5 +349,19 @@ function node {
       }
     } finally {if(prior===undefined) delete process.env.DOCUMENTATION_EXPECTED_METADATA;else process.env.DOCUMENTATION_EXPECTED_METADATA=prior;}
   });
+  test('guardian standard prevents self-clearing baseline holds and deleting policy assets', () => {
+    const {validate: validatePolicy,AREAS: areas,documentationOnly: docsOnly}=require('./documentation-baseline.cjs');
+    const readyManifest={version:1,areas:Object.fromEntries(areas.map(a=>[a,{status:'ready',documents:[`docs/${a}.md`],owner:'tech-lead',coverage:'Defines verified requirements and testable acceptance criteria for this area.'}]))};
+    const pendingManifest={version:1,areas:Object.fromEntries(areas.map(a=>[a,{status:'pending',issue:'https://github.com/wiselead-solutions/example/issues/1'}]))};
+    const content='## Technical Summary\n\n| Area | Impact | Evidence / reason |\n| --- | --- | --- |\n'+areas.map(a=>`| ${a} | unchanged | \`docs/${a}.md\` — Verified acceptance criteria remain unchanged by this adjustment. |`).join('\n')+'\n\n## Testing\nVerified.';
+    const input={manifest:readyManifest,baseManifest:readyManifest,files:[{filename:'src/app.cs',status:'modified'}],body:content,readDocument:()=> '# Canonical specification\n\n'+'Verified requirements and acceptance criteria. '.repeat(8)};
+    assert.equal(validatePolicy(input).ok,true,'positive implementation control');
+    const adoption=validatePolicy({...input,baseManifest:pendingManifest});
+    assert.equal(adoption.ok,false,'implementation cannot clear its own pending baseline');
+    assert.ok(adoption.reasons.some(r=>r.includes('base branch manifest')));
+    const rewritten=JSON.parse(JSON.stringify(readyManifest));rewritten.areas.prd.coverage+=' Additional claims.';
+    assert.equal(validatePolicy({...input,manifest:rewritten}).ok,false,'implementation cannot rewrite resolved evidence');
+    assert.equal(docsOnly([{filename:'.github/workflows/pr-guardian.yml',status:'removed'}]),false,'deleting enforcement is not documentation-only');
+  });
 }
 // guardian-standard:tests:end
