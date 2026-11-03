@@ -39,4 +39,4 @@ backticks plus a concrete explanation. See `docs/documentation-baseline.md`.
 
 <!-- Where to start, key decisions to review, known trade-offs. -->
 
-<!-- Issue link (required by most guardians): Closes #N, Fixes #N, Resolves #N, or Part of #N -->
+<!-- Required issue link: Closes #N, Fixes #N, Resolves #N, or Part of #N -->

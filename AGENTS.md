@@ -42,3 +42,14 @@ Keep the five standard PR headings. The guardian blocks missing/pending/unreadab
 documentation-only completion can proceed. Do not certify unrelated README content as a spec.
 Run `node .github/scripts/documentation-baseline.test.cjs` when changing this gate and keep
 the trusted validator embedded in the guardian byte-for-byte aligned with its script copy.
+
+## Shared PR and Guardian process
+
+The owner-requested [PR and Guardian standard](docs/pr-guardian-standard.md) is authoritative
+for PR metadata and automatic merging. It supersedes older descriptions of guardian matching,
+zero-check handling, `develop` routing, and per-sweep merge counts in this file.
+Branch from `main`, use the five standard PR headings, set an assignee, link the issue, and keep
+the PR draft until merge-ready. Complete the repository's documentation-impact evidence.
+Run `node .github/scripts/documentation-baseline.test.cjs` for Guardian changes and the applicable
+product checks for product changes. The Guardian merges after a fresh audit; preserve explicit
+holds and production approval gates. Its workflow declares the supported repository adapters.

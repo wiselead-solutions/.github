@@ -122,3 +122,8 @@ Fixes always flow **down from the release branch and back up by bot**. Never app
 - [ ] GitHub App installed for bot operations
 - [ ] Artifact retention policy set (Actions storage and minutes are capped)
 - [ ] This document linked from the repo `README.md`
+
+## Shared PR and Guardian process
+
+Contributor PR validation and automatic merging follow the [shared standard](pr-guardian-standard.md).
+The workflow preserves this repository's documentation evidence and deployment routing.

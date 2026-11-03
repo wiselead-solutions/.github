@@ -23,6 +23,8 @@ const prose = value => typeof value === 'string' && value.trim().length >= 20 &&
 const docPath = value => typeof value === 'string' &&
   /^(?:[A-Za-z0-9_. -]+\/)*[A-Za-z0-9_. -]+\.md$/.test(value) &&
   !value.split('/').some(part => part === '.' || part === '..');
+const canonical = value => JSON.stringify(value, (key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.keys(item).sort().map(name => [name, item[name]])) : item);
 const digest = body => crypto.createHash('sha256').update(body || '').digest('hex');
 
 const REGRESSION_FILES = new Map([
@@ -137,12 +139,66 @@ function validate({ manifest, files, body, readDocument, repository }) {
   return { ok: reasons.length === 0, reasons, documentationOnly: docsOnly };
 }
 
-function audit(repository, number, expectedHead, api) {
+function auditState(pr) {
+  return {
+    head: pr.head?.sha, base: pr.base?.sha, body: digest(pr.body), state: pr.state, draft: Boolean(pr.draft),
+    changed_files: pr.changed_files,
+    base_ref: pr.base?.ref,
+    assignees: JSON.stringify((pr.assignees || []).map(user => user.login).sort()),
+    reviewers: JSON.stringify([...(pr.requested_reviewers || []).map(user => user.login), ...(pr.requested_teams || []).map(team => 'team:' + team.slug)].sort()),
+    // A JSON list, not a joined string: a label name may itself contain the separator.
+    labels: JSON.stringify((pr.labels || []).map(label => String(label.name || '').toLowerCase())
+      .filter(name => name !== 'guardian:blocked').sort((a, b) => a.localeCompare(b))),
+  };
+}
+
+function changedFields(before, after) {
+  const was = auditState(before), now = auditState(after);
+  return Object.keys(was).filter(key => was[key] !== now[key])
+    .map(key => `${key} ${JSON.stringify(was[key])} -> ${JSON.stringify(now[key])}`);
+}
+
+// Changes the comparison ignores, logged so a CI-only difference can be traced to its field.
+function ignoredDifferences(before, after) {
+  const notes = [];
+  const raw = pr => JSON.stringify(pr.labels || []);
+  if (raw(before) !== raw(after)) {
+    const keys = pr => [...new Set((pr.labels || []).flatMap(Object.keys))].sort((a, b) => a.localeCompare(b)).join(',');
+    const names = pr => (pr.labels || []).map(label => label.name).join(',');
+    notes.push(`label JSON differs: names [${names(before)}] -> [${names(after)}], keys [${keys(before)}] -> [${keys(after)}]`);
+  }
+  return notes;
+}
+
+function audit(repository, number, expectedHead, api, log = () => {}) {
   if (!/^wiselead-solutions\/[A-Za-z0-9_.-]+$/.test(repository) || !/^[1-9]\d*$/.test(number)) throw Error('Invalid repository or PR number.');
+  // A PR whose labels change mid-audit is audited again from scratch once; the verdict always
+  // comes from a pass whose PR state was identical before and after it, or the audit throws.
+  // Any other change (head, base, body, state, draft, files) throws at once: the workflow checked
+  // the body's sections and issue link before this audit, so only a fresh sweep re-runs them.
+  for (let attempt = 1; ; attempt++) {
+    const { result, before, after } = auditOnce(repository, number, expectedHead, api);
+    for (const note of ignoredDifferences(before, after)) log(`PR #${number} attempt ${attempt}: ignored ${note}`);
+    const changed = changedFields(before, after);
+    if (changed.length === 0) return result;
+    log(`PR #${number} attempt ${attempt}: changed during audit: ${changed.join('; ')}`);
+    if (attempt >= 2 || changed.some(field => !field.startsWith('labels '))) throw Error(`PR changed during documentation audit (${changed.join('; ')}); re-evaluate before merging.`);
+  }
+}
+
+function auditOnce(repository, number, expectedHead, api) {
   const prefix = `repos/${repository}`;
   const before = api(`${prefix}/pulls/${number}`);
   if (before.state !== 'open' || before.draft || !/^[0-9a-f]{40}$/.test(before.head?.sha || '')) throw Error('PR is closed, draft, or its head is unreadable.');
-  if ((before.labels || []).some(label => label.name?.toLowerCase() === 'guardian:skip')) throw Error('PR acquired guardian:skip; do not merge.');
+  if ((before.labels || []).some(label => ['guardian:skip', 'hold', 'blocked:owner', 'paused-hold'].includes(label.name?.toLowerCase()))) throw Error('PR acquired guardian:skip or another explicit hold; do not merge.');
+  if (process.env.DOCUMENTATION_EXPECTED_METADATA) {
+    const expectedMetadata = JSON.parse(process.env.DOCUMENTATION_EXPECTED_METADATA);
+    if (Array.isArray(expectedMetadata.assignees)) expectedMetadata.assignees.sort();
+    const observedMetadata = { body: digest(before.body), base: before.base?.ref,
+      assignees: (before.assignees || []).map(user => user.login).sort(),
+      reviewers: (before.requested_reviewers || []).length + (before.requested_teams || []).length };
+    if (canonical(expectedMetadata) !== canonical(observedMetadata)) throw Error('PR metadata changed since the workflow audited its gates.');
+  }
   if (expectedHead && expectedHead !== before.head.sha) throw Error('PR head changed since CI was audited.');
   const files = [];
   for (let page = 1; page <= 30; page++) {
@@ -153,29 +209,30 @@ function audit(repository, number, expectedHead, api) {
   }
   if (files.length !== before.changed_files || files.length === 0) throw Error('Changed-file inventory is empty or truncated.');
   const cache = new Map();
-  const readDocument = path => {
-    if (cache.has(path)) return cache.get(path);
+  const readAt = (path, ref) => {
+    const key = ref + ':' + path;
+    if (cache.has(key)) return cache.get(key);
     const encoded = path.split('/').map(encodeURIComponent).join('/');
-    const file = api(`${prefix}/contents/${encoded}?ref=${before.head.sha}`);
+    const file = api(`${prefix}/contents/${encoded}?ref=${ref}`);
     if (file.type !== 'file' || file.encoding !== 'base64' || typeof file.content !== 'string') throw Error('Not a readable text file.');
     const text = Buffer.from(file.content, 'base64').toString('utf8');
-    cache.set(path, text); return text;
+    cache.set(key, text); return text;
   };
+  const readDocument = path => readAt(path, before.head.sha);
   const manifest = JSON.parse(readDocument(MANIFEST));
-  const result = validate({ manifest, files, body: before.body, readDocument, repository });
-  const after = api(`${prefix}/pulls/${number}`);
-  if (after.head?.sha !== before.head.sha || after.base?.sha !== before.base?.sha ||
-      digest(after.body) !== digest(before.body) || after.state !== 'open' || after.draft ||
-      after.changed_files !== before.changed_files ||
-      JSON.stringify(after.labels || []) !== JSON.stringify(before.labels || [])) {
-    throw Error('PR changed during documentation audit; re-evaluate before merging.');
+  // A missing or unreadable base manifest leaves baseManifest null, which fails closed.
+  let baseManifest = null;
+  if (/^[0-9a-f]{40}$/.test(before.base?.sha || '')) {
+    try { baseManifest = JSON.parse(readAt(MANIFEST, before.base.sha)); } catch { baseManifest = null; }
   }
-  return { ...result, head: before.head.sha };
+  const result = validate({ manifest, baseManifest, files, body: before.body, readDocument, repository, automation: typeof isAutomationPr === 'function' && isAutomationPr(before, repository) });
+  const after = api(`${prefix}/pulls/${number}`);
+  return { result: { ...result, head: before.head.sha }, before, after };
 }
 
 module.exports = { AREAS, validate, audit, documentationOnly };
 if (require.main === module) {
-  let repository, number, ghPath;
+  let repository, number, ghPath, audited = false;
   const executable = name => {
     const value = process.env[name];
     if (!value || !isAbsolute(value)) throw Error(`Trusted workflow must supply absolute ${name}.`);
@@ -194,8 +251,11 @@ if (require.main === module) {
     const matchIndex = args.indexOf('--match-head-commit');
     let expected = args[1];
     if (mode === '--merge') expected = matchIndex >= 0 ? args[matchIndex + 1] : '';
-    const result = audit(repo, number, expected, api);
+    // The guardian keeps these lines out of the block reasons and echoes them to its log.
+    const log = line => process.stderr.write(`Documentation audit diagnostic: ${line}\n`);
+    const result = audit(repo, number, expected, api, log);
     if (!result.ok) throw Error(result.reasons.join('\n'));
+    audited = true;
     if (mode === '--verify') {
       process.stdout.write(JSON.stringify(result));
     } else if (mode === '--merge') {
@@ -203,9 +263,13 @@ if (require.main === module) {
       const mergeArgs = args.filter(arg => arg !== '--auto');
       if (matchIndex < 0) mergeArgs.push('--match-head-commit', result.head);
       if (!mergeArgs.includes('--repo')) mergeArgs.push('--repo', repo);
+      // ai-org#264: the guardian sets GUARDIAN_MERGE_TOKEN (the release-bot App token) only
+      // for a PR that changes .github/workflows/*; only this merge call uses it.
+      const mergeToken = process.env.GUARDIAN_MERGE_TOKEN;
       process.stdout.write(execFileSync(ghPath, ['pr', 'merge', ...mergeArgs], {
         encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: mergeToken ? { ...process.env, GH_TOKEN: mergeToken } : process.env,
       }));
     } else {
       const [command, ...commandArgs] = args.slice(2);
@@ -217,17 +281,20 @@ if (require.main === module) {
       }));
     }
   } catch (error) {
-    // Best-effort disarm and label; their failures must never turn the gate green.
+    // Best-effort disarm and label; their failures must never turn the gate green. Only a
+    // failed audit is labelled here: a refused merge command after a passing audit (conflict,
+    // workflow permission, policy) is the guardian workflow's to classify and record.
     if (ghPath && /^wiselead-solutions\/[A-Za-z0-9_.-]+$/.test(repository || '') && /^[1-9]\d*$/.test(number || '')) {
       for (const args of [
         ['pr', 'merge', number, '--repo', repository, '--disable-auto'],
-        ['api', '--method', 'POST', `repos/${repository}/issues/${number}/labels`, '-f', 'labels[]=guardian:blocked'],
+        ...(audited ? [] : [['api', '--method', 'POST', `repos/${repository}/issues/${number}/labels`, '-f', 'labels[]=guardian:blocked']]),
       ]) {
         try { execFileSync(ghPath, args, {timeout:30000,stdio:['ignore','ignore','ignore']}); } catch {}
       }
     }
-    const detail = error.stderr ? error.stderr.toString() : error.message;
-    process.stderr.write('Documentation baseline / merge blocked:\n' + detail.slice(0, 4000) + '\n');
+    // A failing helper reports on stdout as well as stderr; keep both for the caller's matching.
+    const detail = [error.stdout, error.stderr].filter(Boolean).map(String).join('\n').trim() || error.message;
+    process.stderr.write((audited ? 'Guardian merge refused:\n' : 'Documentation baseline audit rejected:\n') + detail.slice(0, 4000) + '\n');
     process.exitCode = 1;
   }
 }
