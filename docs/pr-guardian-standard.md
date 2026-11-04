@@ -48,7 +48,12 @@ The shared audit:
    without a start time cannot disappear behind an older success. Only this Guardian's own
    run identities are excluded. A readable trusted workflow inventory explicitly permits
    empty CI in repositories with no other PR workflow.
-5. Runs the trusted documentation pre-audit before publishing a passing verdict or dismissing
+5. Checks the actual head-repository branch ref before publishing a passing unheld verdict
+   and again immediately before spending a merge attempt. Unreadable or mismatched refs
+   block that PR without consuming an attempt; never substitute a newer SHA into an older
+   audit. Fork refs use their actual repository and encoded branch path. The synchronous
+   SHA-bound merge still protects a producer push after the final consistency read.
+   Runs the trusted documentation pre-audit before publishing a passing verdict or dismissing
    an obsolete Guardian review. The merge-time audit repeats it against the same head and
    compares the body digest, base, assignees and requested-reviewer count with the audit.
 6. Dismisses only `github-actions[bot]` changes-requested reviews marked as PR Guardian.
