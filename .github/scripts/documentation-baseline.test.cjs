@@ -191,7 +191,7 @@ test('CLI confirms a committed merge after a lost API response',()=>{
   const auditG = matchG ? matchG[1].split(/\r?\n/).map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n') : '';
   test('guardian shared audit has the reviewed canonical digest', () => {
     assert.ok(matchG, 'shared audit extraction markers must remain');
-    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), 'e0dd62cf2a71004132849abcdbacca5da5d14491409654b1b184b3282ef2cb48');
+    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), '8e899116242e89460b77748269b2f3243687d988921337fadf8730601377904c');
   });
   const bodyG = ['Executive Summary','Technical Summary','Testing','Risk & Rollout','Reviewer Guidance'].map(s => `## ${s}\nVerified change and evidence.`).join('\n\n')+'\nPart of #123';
   const prG = overrides => ({number:1,title:'Standard fixture',body:bodyG,isDraft:false,state:'OPEN',assignees:[{login:'owner'}],reviewRequests:[],labels:[],headRefName:'feature/standard',baseRefName:'main',headRefOid:'a'.repeat(40),author:{login:'owner'},autoMergeRequest:null,...overrides});
@@ -199,6 +199,7 @@ test('CLI confirms a committed merge after a lost API response',()=>{
   const harnessG = String.raw`
 $ErrorActionPreference = 'Stop'
 $fixture = Get-Content -Raw -LiteralPath $env:GUARDIAN_FIXTURE | ConvertFrom-Json
+$script:refReads = @{}
 function Record-Call($kind, $arguments) { @{kind=$kind;args=@($arguments);token=$env:GH_TOKEN} | ConvertTo-Json -Compress -Depth 20 | Add-Content -LiteralPath $env:GUARDIAN_CALLS }
 function gh {
   Record-Call 'gh' $args
@@ -221,13 +222,39 @@ function gh {
       'review' { if($fixture.writeFail){$global:LASTEXITCODE=1};return }
       'merge' {
         if ($args -contains '--disable-auto') {if($fixture.disarmFail){$global:LASTEXITCODE=1};return}
-        if ($fixture.mergeFail) {$global:LASTEXITCODE=1;Write-Output 'base branch policy prohibits the merge'};return
+        if ($fixture.mergeFail -or $fixture.pushAfterRefCheck) {$global:LASTEXITCODE=1;Write-Output 'base branch policy prohibits the merge'};return
       }
       'update-branch' {return}
     }
   }
   if ($args[0] -eq 'api') {
     $endpoint = @($args | Where-Object {$_ -like 'repos/*'})[0]
+    if ($endpoint -match '/pulls/(?<number>[0-9]+)$') {
+      $headPr = @($fixture.prs | Where-Object { $_.number -eq [int]$Matches.number })[0]
+      if ($fixture.headMetadataFail) {$global:LASTEXITCODE=1;return}
+      $payload=@{head=@{sha=$headPr.headRefOid;ref=$headPr.headRefName;repo=@{full_name=$(if($fixture.headRepo){$fixture.headRepo}else{'wiselead-solutions/example'})}}} | ConvertTo-Json -Compress -Depth 8
+      if ($fixture.headMetadataArray) {Write-Output "[$payload]"} else {Write-Output $payload};return
+    }
+    if ($endpoint -match '/git/ref/heads/(?<branch>.+)$') {
+      $branch=[Uri]::UnescapeDataString($Matches.branch)
+      $refPr=@($fixture.prs | Where-Object { $_.headRefName -ceq $branch })[0]
+      if ($fixture.refReadFail -or $fixture.refReadFailFor -eq $refPr.number) {$global:LASTEXITCODE=1;return}
+      if ($fixture.refMalformed) {Write-Output 'not-json';return}
+      $actual=$refPr.headRefOid
+      $key="$($refPr.number)"
+      if (-not $script:refReads.ContainsKey($key)) {$script:refReads[$key]=0}
+      $script:refReads[$key]++
+      if ($fixture.refHeads) {
+        $value=$fixture.refHeads.PSObject.Properties[$key]
+        if ($value) {$actual=$value.Value}
+      }
+      if ($fixture.finalRefHeads -and $script:refReads[$key] -gt 1) {
+        $value=$fixture.finalRefHeads.PSObject.Properties[$key]
+        if ($value) {$actual=$value.Value}
+      }
+      $payload=@{ref=$(if($fixture.actualRefName){$fixture.actualRefName}else{"refs/heads/$branch"});object=@{type=$(if($fixture.refType){$fixture.refType}else{'commit'});sha=$actual}} | ConvertTo-Json -Compress -Depth 8
+      if ($fixture.refArray) {Write-Output "[$payload]"} else {Write-Output $payload};return
+    }
     if ($endpoint -like '*/actions/workflows/pr-guardian.yml/runs*') { Write-Output '["101"]';return }
     if ($endpoint -eq 'repos/wiselead-solutions/example') { Write-Output $(if($fixture.repoAllowed){$fixture.repoAllowed}else{'squash,rebase,merge'});return }
     if ($endpoint -like '*/rules/branches/*') { Write-Output $(if($fixture.allowed){$fixture.allowed}else{'squash,rebase,merge'});return }
@@ -286,6 +313,20 @@ function node {
     ['repository with only its Guardian',{checks:[],onlyGuardian:true},true],
     ['unreadable CI-free response',{ciFree:true,ciFail:true},false],
     ['wrong CI head',{ciHead:'b'.repeat(40)},false],
+    ['cached PR head differs from branch',{refHeads:{1:'b'.repeat(40)}},false],
+    ['unreadable head metadata',{headMetadataFail:true},false],
+    ['array head metadata',{headMetadataArray:true},false],
+    ['unreadable actual branch',{refReadFail:true},false],
+    ['malformed actual branch',{refMalformed:true},false],
+    ['array actual branch',{refArray:true},false],
+    ['non-commit actual branch',{refType:'tag'},false],
+    ['wrong actual branch name',{actualRefName:'refs/heads/other'},false],
+    ['malformed actual head SHA',{refHeads:{1:'not-a-sha'}},false],
+    ['head ref changes immediately before attempt',{finalRefHeads:{1:'b'.repeat(40)}},false],
+    ['fork head repository',{headRepo:'fork-owner/example'},true],
+    ['unsafe head repository',{headRepo:'../outside/extra'},false],
+    ['parent head repository component',{headRepo:'../example'},false],
+    ['dot head repository component',{headRepo:'owner/.'},false],
     ['different workflows',{checks:[checkG('FAILURE'),checkG('SUCCESS',{workflowName:'Other CI',startedAt:'2026-11-02T00:00:00Z'})]},false],
     ['superseded run',{checks:[checkG('CANCELLED'),checkG('SUCCESS',{startedAt:'2026-11-02T00:00:00Z'})]},true],
     ['queued rerun without start time',{checks:[checkG(),checkG('',{status:'QUEUED',startedAt:null})]},false],
@@ -318,6 +359,21 @@ function node {
     assert.equal(batch.merged.length,1,'at most one merge per sweep');
     const refusedBatch=runG({prs:[prG(),prG({number:2})],mergeFail:true});
     assert.equal(refusedBatch.merged.length,1,'an ambiguous first attempt must prevent a second merge attempt');
+    const staleHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refHeads:{1:'b'.repeat(40)}});
+    assert.equal(staleHeadBatch.merged.length,1,'a stale head must not consume the one merge attempt');
+    assert.equal(String(staleHeadBatch.merged[0].args[2]),'2','the independently current PR gets the attempt');
+    assert.ok(!staleHeadBatch.reviews.some(c=>String(c.args[2])==='1'&&c.args.includes('--comment')),'stale cached PR cannot receive a passing verdict');
+    const unreadableHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refReadFailFor:1});
+    assert.equal(String(unreadableHeadBatch.merged[0]?.args[2]),'2','an unreadable branch must not block an independent current PR');
+    const finalHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],finalRefHeads:{1:'b'.repeat(40)}});
+    assert.equal(String(finalHeadBatch.merged[0]?.args[2]),'2','a ref mismatch at the final check spends no merge attempt');
+    const forkHead=runG({headRepo:'fork-owner/example'});
+    assert.ok(forkHead.logged.some(c=>c.args.includes('repos/fork-owner/example/git/ref/heads/feature%2Fstandard')),'read the actual fork repository and encode its branch path');
+    const refPush=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],pushAfterRefCheck:true});
+    assert.equal(refPush.merged.length,1,'a post-ref-check push still consumes only one refused SHA-bound attempt');
+    const shaIndex=refPush.merged[0].args.indexOf('--match-head-commit');
+    assert.equal(refPush.merged[0].args[shaIndex+1],'a'.repeat(40),'never replace the audited SHA with a newer branch SHA');
+    assert.match(refPush.output,/merged=false/,'a refused attempt cannot be reported as merged');
     assert.doesNotMatch(auditG,/--delete-branch/,'branch cleanup must not obscure the merge outcome');
     const failedList=runG({listFail:true});assert.notEqual(failedList.result.status,0,'unreadable inventory cannot mean zero PRs');
     const unrelated=runG({staleReview:true,unrelatedBotReview:true});

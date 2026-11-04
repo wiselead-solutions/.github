@@ -568,6 +568,40 @@ jobs:
                                '-f', 'labels[]=guardian:blocked') 'apply guardian:blocked' $PrNumber)
           }
 
+          function Get-GuardianHeadRefReason([int]$PrNumber, [string]$ExpectedHead, [string]$ExpectedRef) {
+            $pullRaw = (gh api "repos/$env:GITHUB_REPOSITORY/pulls/$PrNumber" 2>&1 | Out-String)
+            $pullExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($pullExit -ne 0) { return 'Could not read the actual head repository and branch' }
+            try { $pull = $pullRaw | ConvertFrom-Json -NoEnumerate } catch { return 'Head repository metadata is malformed' }
+            if ($pull -is [Array] -or $pull -isnot [PSCustomObject] -or
+                $pull.head -is [Array] -or $pull.head -isnot [PSCustomObject] -or
+                $pull.head.repo -is [Array] -or $pull.head.repo -isnot [PSCustomObject] -or $pull.head.repo.full_name -isnot [string] -or
+                $pull.head.ref -isnot [string] -or $pull.head.sha -isnot [string]) { return 'Head repository metadata is malformed' }
+            $headRepo = [string]$pull.head.repo.full_name
+            $headRef = [string]$pull.head.ref
+            if ($headRepo -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
+                (($headRepo -split '/') -contains '.') -or (($headRepo -split '/') -contains '..') -or
+                -not $headRef -or $headRef -cne $ExpectedRef -or
+                [string]$pull.head.sha -cne $ExpectedHead) { return 'Head repository metadata changed or is unreadable; re-audit the PR' }
+            $encodedRef = [Uri]::EscapeDataString($headRef)
+            $refRaw = (gh api "repos/$headRepo/git/ref/heads/$encodedRef" 2>&1 | Out-String)
+            $refExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($refExit -ne 0) { return 'Could not read the actual head branch ref; wait for synchronization and current-head CI' }
+            try { $actualRef = $refRaw | ConvertFrom-Json -NoEnumerate } catch { return 'Actual head branch ref is malformed' }
+            if ($actualRef -is [Array] -or $actualRef -isnot [PSCustomObject] -or
+                $actualRef.object -is [Array] -or $actualRef.object -isnot [PSCustomObject] -or
+                $actualRef.ref -isnot [string] -or $actualRef.object.type -isnot [string] -or
+                $actualRef.object.sha -isnot [string]) { return 'Actual head branch ref is malformed' }
+            $actualHead = [string]$actualRef.object.sha
+            if ([string]$actualRef.ref -cne "refs/heads/$headRef" -or
+                [string]$actualRef.object.type -cne 'commit' -or
+                $actualHead -cnotmatch '^[0-9a-f]{40}$') { return 'Actual head branch ref is unreadable or malformed' }
+            if ($actualHead -cne $ExpectedHead) { return "Actual head branch $actualHead differs from audited PR head $ExpectedHead; wait for synchronization and current-head CI" }
+            return ''
+          }
+
           try {
             $PRS = @($PRS_JSON | ConvertFrom-Json)
           } catch {
@@ -721,6 +755,11 @@ jobs:
             if ($MERGEABLE -eq 'CONFLICTING') { $BLOCK_REASON += $CONFLICT_REASON }
 
             if (-not $BLOCK_REASON -and -not $held) {
+              $headRefReason = Get-GuardianHeadRefReason $NUM $auditedHead $HEAD_REF
+              if ($headRefReason) { $BLOCK_REASON += "`n- $headRefReason" }
+            }
+
+            if (-not $BLOCK_REASON -and -not $held) {
               $docPreference = $ErrorActionPreference
               $ErrorActionPreference = 'Continue'
               try {
@@ -827,6 +866,12 @@ jobs:
                   (@($now.reviewRequests | ConvertTo-Json -Compress -Depth 10) -join '') -cne (@($pr.reviewRequests | ConvertTo-Json -Compress -Depth 10) -join '')
                 if ($metadataChanged -or $now.state -cne 'OPEN' -or $now.isDraft -or "$($now.headRefOid)" -cne $auditedHead -or $nowSkip) {
                   Write-Host "PR #$NUM not merged: it changed during this audit (head $auditedHead -> $($now.headRefOid), state $($now.state), draft $($now.isDraft), guardian:skip $nowSkip); the next run re-audits it"
+                  continue
+                }
+                $headRefReason = Get-GuardianHeadRefReason $NUM $auditedHead $HEAD_REF
+                if ($headRefReason) {
+                  Set-GuardianBlocked $NUM "`n- $headRefReason"
+                  Write-Host "PR #$NUM not merged: actual head ref changed or is unreadable; no merge attempt spent"
                   continue
                 }
                 $useBotToken = $false
