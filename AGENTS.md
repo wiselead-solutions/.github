@@ -53,3 +53,18 @@ the PR draft until merge-ready. Complete the repository's documentation-impact e
 Run `node .github/scripts/documentation-baseline.test.cjs` for Guardian changes and the applicable
 product checks for product changes. The Guardian merges after a fresh audit; preserve explicit
 holds and production approval gates. Its workflow declares the supported repository adapters.
+
+## Local Graphify navigation
+
+See [the scoped runbook](docs/graphify-navigation.md). The project-scoped Codex
+skill is `.codex/skills/graphify/` (`$graphify`). For structural code questions,
+consult a current local graph with `graphify query`, `explain` or `path`. Verify
+important claims in source and use normal `rg`/reads when coverage is insufficient.
+
+Build with `python scripts/graphify-navigation.py`; check with
+`python scripts/graphify-navigation.py check`. The configured scope is `.github/scripts`.
+These limits override the bundled skill's broader defaults: pinned Graphify
+0.9.102, code-only extraction, `GRAPHIFY_BACKEND=none`, no semantic extraction,
+hooks or background services. Keep `graphify-out/` ignored. The graph can miss
+DI, reflection, property getters, UI markup and runtime routing; it cannot prove
+authorization, tenant isolation or deployment safety. Refresh after source changes.
