@@ -43,6 +43,22 @@ test('absent, wrong-version and missing-area manifests fail closed even for docs
   for(const m of [null, {...ready(),version:2}, {version:1,areas:{}}]) assert.equal(run(m,[{filename:'docs/spec.md'}]).ok,false);
 });
 test('all six impact rows required, including automation PRs', () => assert.equal(run(ready(),undefined,'').ok,false));
+test('dependabot PR without an impact table is skipped; a human PR without it is still blocked (shakad#1981)', () => {
+  const { isAutomationPr } = require('./documentation-baseline.cjs');
+  const repo = 'wiselead-solutions/example';
+  const bot = {user:{login:'dependabot[bot]'},head:{ref:'dependabot/nuget/pkg-1.2.3',repo:{full_name:repo}}};
+  assert.equal(isAutomationPr(bot, repo), true);
+  assert.equal(isAutomationPr({...bot,user:{login:'app/dependabot'}}, repo), true);
+  assert.equal(isAutomationPr({...bot,user:{login:'DaraOladapo'}}, repo), false);
+  assert.equal(isAutomationPr({...bot,head:{ref:'feature/x',repo:{full_name:repo}}}, repo), false);
+  assert.equal(isAutomationPr({...bot,head:{ref:bot.head.ref,repo:{full_name:'fork/example'}}}, repo), false);
+  const files = [{filename:'src/app.cs',status:'modified'}];
+  const dependabotBody = 'Bumps pkg from 1.2.2 to 1.2.3.';
+  assert.equal(validate({manifest:ready(), files, body:dependabotBody, readDocument:()=>text, repository:repo, automation:true}).ok, true);
+  assert.equal(validate({manifest:ready(), files, body:dependabotBody, readDocument:()=>text, repository:repo, automation:false}).ok, false);
+  // The manifest must still be valid: automation does not waive a broken baseline.
+  assert.equal(validate({manifest:null, files, body:'', readDocument:()=>text, repository:repo, automation:true}).ok, false);
+});
 test('comments, fenced examples, placeholders and duplicate rows cannot certify impact', () => {
   for(const b of [`<!-- ${body('unchanged')} -->`, '```\n'+body('unchanged')+'\n```', body('unchanged').replaceAll('Verified acceptance criteria remain unchanged.','TODO'),body('unchanged')+'\n'+body('unchanged')]) assert.equal(run(ready(),undefined,b).ok,false);
 });
@@ -191,7 +207,11 @@ test('CLI confirms a committed merge after a lost API response',()=>{
   const auditG = matchG ? matchG[1].split(/\r?\n/).map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n') : '';
   test('guardian shared audit has the reviewed canonical digest', () => {
     assert.ok(matchG, 'shared audit extraction markers must remain');
-    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), '8e899116242e89460b77748269b2f3243687d988921337fadf8730601377904c');
+    // Digest re-pinned for shakad#1981 (wiselead-solutions#243): the doc-baseline verify step is skipped for metadata-exempt PRs,
+    // and the embedded validator skips the impact rows for Dependabot PRs (same change as wiselead-solutions#242).
+    // Digest re-pinned for Guardian policy v2 step 1 (ai-org#170, as edusign#187): no request-changes, stale bot reviews dismissed on every audit.
+    // Digest re-pinned for the review-thread gate (the merge was refused with HTTP 405 while a thread was open); no pre-merge ready claim.
+    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), 'bf038e5cc93a1858e2d86e319b3e335602f97c926ce12c2813448e2dd92c5a7f');
   });
   const bodyG = ['Executive Summary','Technical Summary','Testing','Risk & Rollout','Reviewer Guidance'].map(s => `## ${s}\nVerified change and evidence.`).join('\n\n')+'\nPart of #123';
   const prG = overrides => ({number:1,title:'Standard fixture',body:bodyG,isDraft:false,state:'OPEN',assignees:[{login:'owner'}],reviewRequests:[],labels:[],headRefName:'feature/standard',baseRefName:'main',headRefOid:'a'.repeat(40),author:{login:'owner'},autoMergeRequest:null,...overrides});
@@ -222,10 +242,25 @@ function gh {
       'review' { if($fixture.writeFail){$global:LASTEXITCODE=1};return }
       'merge' {
         if ($args -contains '--disable-auto') {if($fixture.disarmFail){$global:LASTEXITCODE=1};return}
-        if ($fixture.mergeFail -or $fixture.pushAfterRefCheck) {$global:LASTEXITCODE=1;Write-Output 'base branch policy prohibits the merge'};return
+        if ($fixture.mergeFail -or $fixture.pushAfterRefCheck) {$global:LASTEXITCODE=1;Write-Output $(if($fixture.mergeMessage){$fixture.mergeMessage}else{'base branch policy prohibits the merge'})};return
       }
+      'comment' { if($fixture.writeFail){$global:LASTEXITCODE=1};return }
       'update-branch' {return}
     }
+  }
+  if ($args[0] -eq 'api' -and $args[1] -eq 'graphql') {
+    if ($fixture.threadsFail) {$global:LASTEXITCODE=1;return}
+    if ($fixture.threadsMalformed) {Write-Output '{"data":null}';return}
+    $all=@($fixture.threads | Where-Object {$_})
+    $after=0
+    $cursorArg=@($args | Where-Object {$_ -like 'cursor=*'})[0]
+    if ($cursorArg) {$after=[int]($cursorArg -replace '^cursor=page','')}
+    $size=if($fixture.threadPageSize){[int]$fixture.threadPageSize}else{100}
+    $slice=@($all | Select-Object -Skip $after -First $size)
+    $more=($after+$size) -lt $all.Count
+    $nodes=@($slice | ForEach-Object {@{isResolved=[bool]$_.resolved;isOutdated=[bool]$_.outdated;path=$_.path;line=$_.line;originalLine=$_.originalLine;comments=@{nodes=@(@{author=@{login=$_.author}})}}})
+    @{data=@{repository=@{pullRequest=@{reviewThreads=@{pageInfo=@{hasNextPage=$more;endCursor=$(if($more){"page$($after+$size)"}else{$null})};nodes=$nodes}}}}} | ConvertTo-Json -Depth 20 -Compress
+    return
   }
   if ($args[0] -eq 'api') {
     $endpoint = @($args | Where-Object {$_ -like 'repos/*'})[0]
@@ -274,7 +309,7 @@ function node {
   Record-Call 'documentation' $args
   $global:LASTEXITCODE=0
   if($fixture.docFail -or ($fixture.docMergeFail -and $args -contains '--merge')){$global:LASTEXITCODE=1;Write-Output 'Documentation baseline audit rejected: pending documentation';return}
-  if($args -contains '--merge') { gh pr merge $args[3] --match-head-commit $args[-1]; if($LASTEXITCODE -ne 0){Write-Output 'Guardian merge refused: base branch policy prohibits the merge'} }
+  if($args -contains '--merge') { gh pr merge $args[3] --match-head-commit $args[-1]; if($LASTEXITCODE -ne 0){Write-Output 'Guardian merge refused'} }
   else {Write-Output '{"ok":true}'}
 }
 `;
@@ -287,7 +322,11 @@ function node {
       fsG.mkdirSync(pathG.join(dir,'.github/workflows'),{recursive:true});
       fsG.writeFileSync(pathG.join(dir,'.github/workflows',config.onlyGuardian?'pr-guardian.yml':'fixture.yml'),config.workflowSource||(config.ciFree?'on: workflow_dispatch\n':'on:\n  pull_request:\n'));
       const scripts=pathG.join(dir,'audit.ps1');fsG.writeFileSync(scripts,harnessG+'\n'+script);
-      const result=cpG.spawnSync('pwsh',['-NoLogo','-NoProfile','-NonInteractive','-File',scripts],{encoding:'utf8',timeout:30000,cwd:dir,env:{...process.env,GH_TOKEN:'fixture-only-token',GUARDIAN_MERGE_TOKEN:'',GUARDIAN_WORKFLOW_TOKEN:'',GUARDIAN_REQUIRE_REVIEWER:'false',GUARDIAN_RELEASE_METADATA_EXEMPT:'false',GUARDIAN_AUDIT_HELD:'false',GUARDIAN_STALE_BASE_THRESHOLD:'0',GUARDIAN_DEFAULT_BRANCH:'main',DOCUMENTATION_VALIDATOR_PATH:'fixture-only',GITHUB_REPOSITORY:'wiselead-solutions/example',GITHUB_RUN_ID:'101',GITHUB_OUTPUT:output,GUARDIAN_FIXTURE:fixture,GUARDIAN_CALLS:calls,...env}});
+      // pwsh can die before it runs a line (a signal or hang gives status null; review-pop 2026-11-13T21:47 hit a .NET FileLoadException abort on a macOS runner).
+      // That is a runner fault, not a policy result: retry up to twice with a long limit. A real policy failure still has a numeric status.
+      const spawnAudit=()=>cpG.spawnSync('pwsh',['-NoLogo','-NoProfile','-NonInteractive','-File',scripts],{encoding:'utf8',timeout:120000,cwd:dir,env:{...process.env,GH_TOKEN:'fixture-only-token',GUARDIAN_MERGE_TOKEN:'',GUARDIAN_WORKFLOW_TOKEN:'',GUARDIAN_REQUIRE_REVIEWER:'false',GUARDIAN_RELEASE_METADATA_EXEMPT:'false',GUARDIAN_AUDIT_HELD:'false',GUARDIAN_STALE_BASE_THRESHOLD:'0',GUARDIAN_DEFAULT_BRANCH:'main',DOCUMENTATION_VALIDATOR_PATH:'fixture-only',GITHUB_REPOSITORY:'wiselead-solutions/example',GITHUB_RUN_ID:'101',GITHUB_OUTPUT:output,GUARDIAN_FIXTURE:fixture,GUARDIAN_CALLS:calls,...env}});
+      let result=spawnAudit();
+      for(let retry=0;result.status===null&&retry<2;retry++){fsG.writeFileSync(calls,'');fsG.writeFileSync(output,'');result=spawnAudit();}
       const logged=fsG.readFileSync(calls,'utf8').trim().split(/\r?\n/).filter(Boolean).map(JSON.parse);
       return {result,logged,output:fsG.readFileSync(output,'utf8'),merged:logged.filter(c=>c.kind==='gh'&&c.args[0]==='pr'&&c.args[1]==='merge'&&!c.args.includes('--disable-auto')),reviews:logged.filter(c=>c.kind==='gh'&&c.args[0]==='pr'&&c.args[1]==='review')};
     } finally {fsG.rmSync(dir,{recursive:true,force:true});}
@@ -332,6 +371,13 @@ function node {
     ['queued rerun without start time',{checks:[checkG(),checkG('',{status:'QUEUED',startedAt:null})]},false],
     ['ignore only guardian run',{checks:[checkG('',{status:'IN_PROGRESS',detailsUrl:'https://github.com/wiselead-solutions/example/actions/runs/101/job/1'}),checkG()]},true],
     ['documentation pre-audit',{docFail:true},false],
+    ['unresolved review thread',{threads:[{path:'src/app.cs',line:7,author:'reviewer-bot'}]},false],
+    ['unresolved thread without a line',{threads:[{path:'src/app.cs',originalLine:3,author:'reviewer-bot'}]},false],
+    ['resolved review thread',{threads:[{path:'src/app.cs',line:7,author:'reviewer-bot',resolved:true}]},true],
+    ['outdated unresolved thread',{threads:[{path:'src/app.cs',line:7,author:'reviewer-bot',outdated:true}]},true],
+    ['unresolved thread on a later page',{threads:[{resolved:true,path:'a',line:1,author:'x'},{resolved:true,path:'b',line:1,author:'x'},{path:'c.cs',line:9,author:'late-reviewer'}],threadPageSize:2},false],
+    ['unreadable review threads',{threadsFail:true},false],
+    ['malformed review threads',{threadsMalformed:true},false],
     ['conflict',{conflict:true},false],
     ['skip label',{prs:[prG({labels:[{name:'guardian:skip'}]})]},false],
     ['owner hold',{prs:[prG({labels:[{name:'blocked:owner'}]})]},false],
@@ -352,7 +398,7 @@ function node {
       const run=runG(cfg,env);
       assert.equal(run.result.status,0,name+': '+run.result.stderr+'\n'+run.result.stdout);
       assert.equal(run.merged.length>0,shouldMerge,name+': '+run.result.stdout+'\n'+JSON.stringify(run.reviews));
-      if(cfg.docFail) assert.ok(!run.reviews.some(c=>c.args.includes('--comment')),'documentation refusal never publishes a pass verdict');
+      if(cfg.docFail) assert.ok(!run.reviews.some(c=>c.args.includes('--comment')&&!/Blocked/.test(c.args.join(' '))),'documentation refusal never publishes a pass verdict');
       if(cfg.writeFail||cfg.reviewReadFail) assert.match(run.output,/gh_failures=[1-9]/,name+' must fail the final workflow step');
     }
     const batch=runG({prs:[prG(),prG({number:2})]});
@@ -362,7 +408,7 @@ function node {
     const staleHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refHeads:{1:'b'.repeat(40)}});
     assert.equal(staleHeadBatch.merged.length,1,'a stale head must not consume the one merge attempt');
     assert.equal(String(staleHeadBatch.merged[0].args[2]),'2','the independently current PR gets the attempt');
-    assert.ok(!staleHeadBatch.reviews.some(c=>String(c.args[2])==='1'&&c.args.includes('--comment')),'stale cached PR cannot receive a passing verdict');
+    assert.ok(!staleHeadBatch.reviews.some(c=>String(c.args[2])==='1'&&c.args.includes('--comment')&&!/Blocked/.test(c.args.join(' '))),'stale cached PR cannot receive a passing verdict');
     const unreadableHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refReadFailFor:1});
     assert.equal(String(unreadableHeadBatch.merged[0]?.args[2]),'2','an unreadable branch must not block an independent current PR');
     const finalHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],finalRefHeads:{1:'b'.repeat(40)}});
@@ -375,6 +421,33 @@ function node {
     assert.equal(refPush.merged[0].args[shaIndex+1],'a'.repeat(40),'never replace the audited SHA with a newer branch SHA');
     assert.match(refPush.output,/merged=false/,'a refused attempt cannot be reported as merged');
     assert.doesNotMatch(auditG,/--delete-branch/,'branch cleanup must not obscure the merge outcome');
+    const bodyOf=run=>run.logged.filter(c=>c.kind==='gh'&&c.args[0]==='pr'&&c.args[1]==='review').map(c=>String(c.args[c.args.indexOf('--body')+1]));
+    const blockedLabel=run=>run.logged.some(c=>c.kind==='gh'&&c.args[0]==='api'&&c.args.includes('labels[]=guardian:blocked'));
+    const labelCleared=run=>run.logged.some(c=>c.kind==='gh'&&c.args[0]==='api'&&c.args.includes('DELETE')&&c.args.some(a=>String(a).endsWith('/labels/guardian%3Ablocked')));
+    const threaded=runG({threads:[{path:'src/app.cs',line:7,author:'reviewer-bot'},{resolved:true,path:'done.cs',line:1,author:'other'},{path:'old.cs',line:2,author:'stale',outdated:true}]});
+    assert.equal(threaded.merged.length,0,'an unresolved thread prevents the merge attempt');
+    const threadVerdict=bodyOf(threaded).join('\n');
+    assert.match(threadVerdict,/Blocked/); assert.match(threadVerdict,/src\/app\.cs:7 by @reviewer-bot/);
+    assert.doesNotMatch(threadVerdict,/done\.cs|old\.cs/,'resolved and outdated threads are not listed');
+    assert.ok(blockedLabel(threaded),'guardian:blocked stays on while a thread is open');
+    assert.ok(!labelCleared(threaded),'guardian:blocked is not cleared while a thread is open');
+    const paged=runG({threads:[{path:'a',line:1,author:'x'},{path:'b',line:1,author:'x'},{path:'c.cs',line:9,author:'late-reviewer'}],threadPageSize:2});
+    assert.match(bodyOf(paged).join('\n'),/c\.cs:9 by @late-reviewer/,'every page of review threads is audited');
+    const ruleset=runG({mergeFail:true,mergeMessage:'All comments must be resolved. (HTTP 405)'});
+    const refusalVerdicts=bodyOf(ruleset);
+    assert.ok(!refusalVerdicts.some(b=>/ready, and merging/.test(b)),'a merge that was refused is never announced as ready and merging');
+    assert.ok(refusalVerdicts.some(b=>/Blocked/.test(b)&&/All comments must be resolved\. \(HTTP 405\)/.test(b)),'the refusal text is posted in a Blocked verdict');
+    assert.ok(ruleset.logged.some(c=>c.kind==='gh'&&c.args[0]==='pr'&&c.args[1]==='review'&&c.args.includes('--comment')&&/Blocked/.test(c.args.join(' '))),'the refusal verdict is a Blocked COMMENT review (policy v2: never request changes)');
+    assert.ok(blockedLabel(ruleset),'a refused merge applies guardian:blocked');
+    assert.ok(!labelCleared(ruleset),'a refused merge never clears guardian:blocked');
+    assert.match(ruleset.output,/merged=false/);
+    const success=runG({});
+    assert.ok(!bodyOf(success).some(b=>/ready, and merging/.test(b)),'no pre-merge ready-and-merging claim');
+    const mergeAt=success.logged.findIndex(c=>c.kind==='documentation'&&c.args.includes('--merge'));
+    const clearAt=success.logged.findIndex(c=>c.kind==='gh'&&c.args[0]==='api'&&c.args.some(a=>String(a).endsWith('/labels/guardian%3Ablocked')));
+    const noticeAt=success.logged.findIndex(c=>c.kind==='gh'&&c.args[0]==='pr'&&c.args[1]==='comment'&&c.args.some(a=>/merged/.test(String(a))));
+    assert.ok(mergeAt>=0&&clearAt>mergeAt&&noticeAt>mergeAt,'the label is cleared and "merged" is announced only after the merge call succeeds');
+    assert.doesNotMatch(auditG,/ready, and merging/,'the audit never contains the pre-merge ready claim');
     const failedList=runG({listFail:true});assert.notEqual(failedList.result.status,0,'unreadable inventory cannot mean zero PRs');
     const unrelated=runG({staleReview:true,unrelatedBotReview:true});
     assert.ok(unrelated.logged.some(c=>c.args.some(a=>String(a).includes('/reviews/500/dismissals'))),'dismiss own stale review');
@@ -397,7 +470,7 @@ function node {
     assert.doesNotMatch(workflowG,/\n  pull_request(?:_review)?:/);
     assert.match(workflowG,/ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
     assert.match(workflowG,/persist-credentials: false/);
-    assert.match(workflowG,/group: pr-guardian-\$\{\{ github\.repository \}\}/);
+    assert.match(workflowG,/group: pr-guardian-\$\{\{ github\.repository \}\}\$\{\{ github\.event_name == 'pull_request_target' && format\('-pr-\{0\}', github\.event\.pull_request\.number\) \|\| '' \}\}/);
     assert.match(workflowG,/cancel-in-progress: false/);
     assert.doesNotMatch(auditG,/--auto(?:\s|$)/);
     assert.match(auditG,/--match-head-commit/);
