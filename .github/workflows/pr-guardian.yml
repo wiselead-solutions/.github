@@ -981,7 +981,7 @@ jobs:
                   } elseif ($MERGE_OUT -match 'Head branch was modified') {
                     Write-Host "PR #$NUM not merged: its head moved after the audit read it; the next sweep re-audits it"
                   } elseif ($MERGE_OUT -match 'Documentation baseline audit rejected') {
-                    Set-GuardianBlocked $NUM "`n- Merge-time documentation audit refused the PR; see the audit log and re-evaluate its evidence"
+                    Set-GuardianBlocked $NUM "$REFUSAL_REASON`n- Merge-time documentation audit refused the PR; see the audit log and re-evaluate its evidence"
                   } elseif ($useBotToken) {
                     $guardianToken = $env:GH_TOKEN
                     $env:GH_TOKEN = $env:GUARDIAN_WORKFLOW_TOKEN
