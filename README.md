@@ -48,3 +48,7 @@ Welcome, team! This repository holds organisation-wide GitHub defaults (issue te
 ## Ways of working
 
 See [docs/WAYS-OF-WORKING.md](docs/WAYS-OF-WORKING.md) for environments, branching, the release train, code review and production approval.
+
+## GitHub Actions runners
+
+The organization dual-runner policy is documented in [docs/dual-runner-policy.md](docs/dual-runner-policy.md).
