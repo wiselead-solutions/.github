@@ -56,12 +56,20 @@ The shared audit:
    Runs the trusted documentation pre-audit before publishing a passing verdict or dismissing
    an obsolete Guardian review. The merge-time audit repeats it against the same head and
    compares the body digest, base, assignees and requested-reviewer count with the audit.
-6. Dismisses only `github-actions[bot]` changes-requested reviews marked as PR Guardian.
+   Reads every review thread of the PR through GraphQL. Any unresolved, non-outdated thread
+   blocks the PR, lists each as `path:line` by its first author, and keeps `guardian:blocked`.
+   An unreadable or malformed thread read also blocks. Outdated threads are not listed, but a
+   ruleset that requires conversation resolution can still refuse the merge for them.
+6. Never requests changes: a blocked verdict is a COMMENT review plus `guardian:blocked` (dev-hub#2779, ai-org#170 policy v2). On every audit, blocked or passing, it dismisses only `github-actions[bot]` changes-requested reviews marked as PR Guardian.
    Human reviews and other automation reviews remain intact. Unchanged verdicts are not reposted.
 7. Re-reads metadata and holds, then requests a synchronous REST merge bound to the audited head.
    Queue-only rules refuse this request; the Guardian never arms deferred auto-merge. A lost
    response requires server confirmation of the merged audited head. Branch cleanup is separate
    from the merge result and may be handled by repository auto-delete settings.
+   Before the merge the Guardian posts only that it is attempting it, never "ready, and merging".
+   It posts "merged" and clears `guardian:blocked` only after the merge call succeeds. Any other
+   refusal (for example HTTP 405 `All comments must be resolved.`) is posted as a Blocked
+   verdict with the refusal text, and `guardian:blocked` stays on.
    Feature PRs squash; release, hotfix and backmerge PRs prefer a merge commit into the default
    branch. Repository settings and effective rulesets can require a supported fallback.
    Long-lived branches are retained.
