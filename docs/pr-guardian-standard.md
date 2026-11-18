@@ -65,8 +65,11 @@ The shared audit:
    Feature PRs squash; release, hotfix and backmerge PRs prefer a merge commit into the default
    branch. Repository settings and effective rulesets can require a supported fallback.
    Long-lived branches are retained.
-8. Attempts at most one merge per sweep, allowing the next sweep to read a fresh base even
-   after an ambiguous result. Every PR is
+8. Attempts at most `GUARDIAN_MAX_MERGES_PER_SWEEP` merges per sweep (default 1 when unset or
+   invalid; this repository sets 5). Before every merge after the first, it re-reads the PR's
+   `mergeable` and `mergeStateStatus` and defers it to the next sweep unless it is `MERGEABLE`
+   and `CLEAN`, `UNSTABLE` or `HAS_HOOKS`. A refused or ambiguous merge stops further merges
+   in that sweep, so the next sweep reads a fresh base. Every PR is
    still audited. Failed review or label writes prevent that PR's merge; failures accumulate
    and fail the final workflow step after any required post-merge dispatch.
 
@@ -107,7 +110,7 @@ do not copy another product's documentation manifest or claim its evidence.
 Run `node .github/scripts/documentation-baseline.test.cjs` and validate the workflow with
 `actionlint`. The shared fixtures execute the real audit with API doubles: they do not contact
 GitHub. They cover metadata, CI states, reruns, head and hold races, reviewer adapters, failed
-verdicts, stale bases, branch history, and one merge per sweep. Existing product-specific
+verdicts, stale bases, branch history, and the per-sweep merge limit with its fresh-base re-read. Existing product-specific
 workflow tests remain required. Run applicable product tests when product code also changes.
 
 Keep `workflow_run.workflows` equal to the actual names of workflows triggered by

@@ -191,7 +191,7 @@ test('CLI confirms a committed merge after a lost API response',()=>{
   const auditG = matchG ? matchG[1].split(/\r?\n/).map(line => line.startsWith('          ') ? line.slice(10) : line).join('\n') : '';
   test('guardian shared audit has the reviewed canonical digest', () => {
     assert.ok(matchG, 'shared audit extraction markers must remain');
-    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), '8e899116242e89460b77748269b2f3243687d988921337fadf8730601377904c');
+    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), '415ad0fdcb8d4aa505fd748c7f213d1e72b02c814b2fd701f9f8b84c39f52561');
   });
   const bodyG = ['Executive Summary','Technical Summary','Testing','Risk & Rollout','Reviewer Guidance'].map(s => `## ${s}\nVerified change and evidence.`).join('\n\n')+'\nPart of #123';
   const prG = overrides => ({number:1,title:'Standard fixture',body:bodyG,isDraft:false,state:'OPEN',assignees:[{login:'owner'}],reviewRequests:[],labels:[],headRefName:'feature/standard',baseRefName:'main',headRefOid:'a'.repeat(40),author:{login:'owner'},autoMergeRequest:null,...overrides});
@@ -216,6 +216,7 @@ function gh {
           @{statusCheckRollup=@($fixture.checks);headRefOid=$(if($fixture.ciHead){$fixture.ciHead}else{$pr.headRefOid})} | ConvertTo-Json -Depth 30 -Compress;return
         }
         if ($fields -eq 'mergeable') { @{mergeable=$(if($fixture.conflict){'CONFLICTING'}else{'MERGEABLE'})} | ConvertTo-Json -Compress;return }
+        if ($fields -eq 'mergeable,mergeStateStatus') { @{mergeable=$(if($fixture.conflict){'CONFLICTING'}else{'MERGEABLE'});mergeStateStatus=$(if($fixture.freshState){$fixture.freshState}else{'CLEAN'})} | ConvertTo-Json -Compress;return }
         if ($fields -eq 'files') { @{files=@(@{path=$(if($fixture.workflowFile){'.github/workflows/pr-ci.yml'}else{'src/app.cs'})})} | ConvertTo-Json -Depth 5 -Compress;return }
         if ($fixture.final) { $fixture.final | ConvertTo-Json -Depth 30 -Compress } else { $pr | ConvertTo-Json -Depth 30 -Compress };return
       }
@@ -359,6 +360,14 @@ function node {
     assert.equal(batch.merged.length,1,'at most one merge per sweep');
     const refusedBatch=runG({prs:[prG(),prG({number:2})],mergeFail:true});
     assert.equal(refusedBatch.merged.length,1,'an ambiguous first attempt must prevent a second merge attempt');
+    const multi=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'}),prG({number:3,headRefName:'feature/third'})]},{GUARDIAN_MAX_MERGES_PER_SWEEP:'2'});
+    assert.equal(multi.merged.length,2,'the configured limit allows several merges per sweep');
+    const multiBehind=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],freshState:'BEHIND'},{GUARDIAN_MAX_MERGES_PER_SWEEP:'5'});
+    assert.equal(multiBehind.merged.length,1,'a PR that is not cleanly mergeable on the fresh read is left for the next sweep');
+    const multiRefused=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],mergeFail:true},{GUARDIAN_MAX_MERGES_PER_SWEEP:'5'});
+    assert.equal(multiRefused.merged.length,1,'a refused merge stops further merges this sweep');
+    const invalidLimit=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})]},{GUARDIAN_MAX_MERGES_PER_SWEEP:'abc'});
+    assert.equal(invalidLimit.merged.length,1,'an invalid limit falls back to one merge');
     const staleHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refHeads:{1:'b'.repeat(40)}});
     assert.equal(staleHeadBatch.merged.length,1,'a stale head must not consume the one merge attempt');
     assert.equal(String(staleHeadBatch.merged[0].args[2]),'2','the independently current PR gets the attempt');
