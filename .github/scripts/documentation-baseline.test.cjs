@@ -211,7 +211,7 @@ test('CLI confirms a committed merge after a lost API response',()=>{
     // and the embedded validator skips the impact rows for Dependabot PRs (same change as wiselead-solutions#242).
     // Digest re-pinned for Guardian policy v2 step 1 (ai-org#170, as edusign#187): no request-changes, stale bot reviews dismissed on every audit.
     // Digest re-pinned for the review-thread gate (the merge was refused with HTTP 405 while a thread was open); no pre-merge ready claim.
-    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), 'bf038e5cc93a1858e2d86e319b3e335602f97c926ce12c2813448e2dd92c5a7f');
+    assert.equal(cryptoG.createHash('sha256').update(auditG).digest('hex'), 'b721c6155b9b89cb16b1db2f643272e6056f7099c699cf5c3924fc5b811c07cc');
   });
   const bodyG = ['Executive Summary','Technical Summary','Testing','Risk & Rollout','Reviewer Guidance'].map(s => `## ${s}\nVerified change and evidence.`).join('\n\n')+'\nPart of #123';
   const prG = overrides => ({number:1,title:'Standard fixture',body:bodyG,isDraft:false,state:'OPEN',assignees:[{login:'owner'}],reviewRequests:[],labels:[],headRefName:'feature/standard',baseRefName:'main',headRefOid:'a'.repeat(40),author:{login:'owner'},autoMergeRequest:null,...overrides});
@@ -236,6 +236,7 @@ function gh {
           @{statusCheckRollup=@($fixture.checks);headRefOid=$(if($fixture.ciHead){$fixture.ciHead}else{$pr.headRefOid})} | ConvertTo-Json -Depth 30 -Compress;return
         }
         if ($fields -eq 'mergeable') { @{mergeable=$(if($fixture.conflict){'CONFLICTING'}else{'MERGEABLE'})} | ConvertTo-Json -Compress;return }
+        if ($fields -eq 'mergeable,mergeStateStatus') { @{mergeable=$(if($fixture.conflict){'CONFLICTING'}else{'MERGEABLE'});mergeStateStatus=$(if($fixture.freshState){$fixture.freshState}else{'CLEAN'})} | ConvertTo-Json -Compress;return }
         if ($fields -eq 'files') { @{files=@(@{path=$(if($fixture.workflowFile){'.github/workflows/pr-ci.yml'}else{'src/app.cs'})})} | ConvertTo-Json -Depth 5 -Compress;return }
         if ($fixture.final) { $fixture.final | ConvertTo-Json -Depth 30 -Compress } else { $pr | ConvertTo-Json -Depth 30 -Compress };return
       }
@@ -405,6 +406,14 @@ function node {
     assert.equal(batch.merged.length,1,'at most one merge per sweep');
     const refusedBatch=runG({prs:[prG(),prG({number:2})],mergeFail:true});
     assert.equal(refusedBatch.merged.length,1,'an ambiguous first attempt must prevent a second merge attempt');
+    const multi=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'}),prG({number:3,headRefName:'feature/third'})]},{GUARDIAN_MAX_MERGES_PER_SWEEP:'2'});
+    assert.equal(multi.merged.length,2,'the configured limit allows several merges per sweep');
+    const multiBehind=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],freshState:'BEHIND'},{GUARDIAN_MAX_MERGES_PER_SWEEP:'5'});
+    assert.equal(multiBehind.merged.length,1,'a PR that is not cleanly mergeable on the fresh read is left for the next sweep');
+    const multiRefused=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],mergeFail:true},{GUARDIAN_MAX_MERGES_PER_SWEEP:'5'});
+    assert.equal(multiRefused.merged.length,1,'a refused merge stops further merges this sweep');
+    const invalidLimit=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})]},{GUARDIAN_MAX_MERGES_PER_SWEEP:'abc'});
+    assert.equal(invalidLimit.merged.length,1,'an invalid limit falls back to one merge');
     const staleHeadBatch=runG({prs:[prG(),prG({number:2,headRefName:'feature/second'})],refHeads:{1:'b'.repeat(40)}});
     assert.equal(staleHeadBatch.merged.length,1,'a stale head must not consume the one merge attempt');
     assert.equal(String(staleHeadBatch.merged[0].args[2]),'2','the independently current PR gets the attempt');

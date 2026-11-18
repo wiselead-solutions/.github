@@ -33,6 +33,7 @@ jobs:
       GUARDIAN_RELEASE_METADATA_EXEMPT: 'false'
       GUARDIAN_AUDIT_HELD: 'false'
       GUARDIAN_STALE_BASE_THRESHOLD: '0'
+      GUARDIAN_MAX_MERGES_PER_SWEEP: '5'
     steps:
       - name: Checkout trusted policy
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -533,6 +534,9 @@ jobs:
 
           $merged = $false
           $mergeAttempted = $false
+          $mergeCount = 0
+          $mergeStopped = $false
+          $maxMerges = if ($env:GUARDIAN_MAX_MERGES_PER_SWEEP -match '^[1-9]\d?$') { [int]$env:GUARDIAN_MAX_MERGES_PER_SWEEP } else { 1 }
           $appMerged = $false
           $tokenMerged = $false
 
@@ -880,8 +884,8 @@ jobs:
                 continue
               }
               if ($ghFailures.Count -gt $failuresBefore) { Write-Host "PR #$NUM not merged: verdict actions failed"; continue }
-              if ($merged -or $mergeAttempted) {
-                Write-Host "PR #$NUM PASSED but already merged one PR this sweep -- leaving it for the next sweep (#2140)."
+              if ($mergeStopped -or $mergeCount -ge $maxMerges) {
+                Write-Host "PR #$NUM PASSED but this sweep already reached its merge limit ($mergeCount of $maxMerges, stopped $mergeStopped) -- leaving it for the next sweep (#2140)."
               } else {
                 $mergeMethod = if ($BASE_REF -eq $env:GUARDIAN_DEFAULT_BRANCH -and "$($pr.headRefName)" -cmatch '^(release|hotfix|backmerge)/') { '--merge' } else { '--squash' }
                 $ALLOWED = @('merge', 'squash', 'rebase')
@@ -930,6 +934,17 @@ jobs:
                   Write-Host "PR #$NUM not merged: actual head ref changed or is unreadable; no merge attempt spent"
                   continue
                 }
+                if ($mergeCount -gt 0) {
+                  $freshJson = gh pr view $NUM --json 'mergeable,mergeStateStatus'
+                  $freshOk = ($LASTEXITCODE -eq 0)
+                  $global:LASTEXITCODE = 0
+                  $fresh = $null
+                  if ($freshOk -and $freshJson) { try { $fresh = $freshJson | ConvertFrom-Json } catch { $fresh = $null } }
+                  if (-not $fresh -or "$($fresh.mergeable)" -cne 'MERGEABLE' -or "$($fresh.mergeStateStatus)" -cnotin @('CLEAN', 'UNSTABLE', 'HAS_HOOKS')) {
+                    Write-Host "PR #$NUM not merged: after an earlier merge this sweep its fresh base read is not mergeable ($($fresh.mergeable)/$($fresh.mergeStateStatus)); the next sweep re-audits it"
+                    continue
+                  }
+                }
                 $useBotToken = $false
                 if ($env:GUARDIAN_WORKFLOW_TOKEN) {
                   $filesJson = (gh pr view $NUM --json files | Out-String)
@@ -947,6 +962,7 @@ jobs:
                 $MERGE_OUT = (node $env:DOCUMENTATION_VALIDATOR_PATH --merge $env:GITHUB_REPOSITORY $NUM $mergeMethod --match-head-commit $auditedHead 2>&1 | Out-String).Trim()
                 if ($LASTEXITCODE -eq 0) {
                   $merged = $true
+                  $mergeCount++
                   "merged_base=$BASE_REF" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
                   "merged_pr=$NUM" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
                   if ($useBotToken) { $appMerged = $true } else { $tokenMerged = $true }
@@ -954,6 +970,7 @@ jobs:
                   [void](Invoke-Gh @('api', '--method', 'DELETE', "repos/$env:GITHUB_REPOSITORY/issues/$NUM/labels/guardian%3Ablocked") 'clear guardian:blocked' $NUM -BenignIfMatches 'Label does not exist|Not Found|HTTP 404')
                   [void](Invoke-Gh @('pr', 'comment', "$NUM", '--body', '✅ **PR Guardian** — merged.') 'post the merged notice' $NUM)
                 } else {
+                  $mergeStopped = $true
                   Write-Host "PR #$NUM MERGE REFUSED (exit $LASTEXITCODE): $MERGE_OUT"
                   $refusalText = (($MERGE_OUT -replace '\s+', ' ').Replace('`', "'")).Trim()
                   if ($refusalText.Length -gt 400) { $refusalText = $refusalText.Substring(0, 400) + '...' }
