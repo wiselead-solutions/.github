@@ -24,7 +24,7 @@ jobs:
       || (github.event.action != 'labeled' && github.event.action != 'unlabeled')
       || contains(fromJSON('["guardian:skip","hold","blocked:owner","paused-hold"]'), github.event.label.name)
     concurrency:
-      group: pr-guardian-${{ github.repository }}${{ github.event_name == 'pull_request_target' && format('-pr-{0}', github.event.pull_request.number) || '' }}
+      group: pr-guardian-${{ github.repository }}
       cancel-in-progress: false
     runs-on: [self-hosted]
     env:
@@ -631,7 +631,7 @@ jobs:
               $exit = $LASTEXITCODE
               $global:LASTEXITCODE = 0
               if ($exit -ne 0) { return @('Could not read review threads; the next run re-audits them') }
-              try { $threads = ($raw | ConvertFrom-Json -NoEnumerate).data.repository.pullRequest.reviewThreads } catch { $threads = $null }
+              try { $payload = $raw | ConvertFrom-Json -NoEnumerate; if ($null -ne $payload.errors -and @($payload.errors).Count -gt 0) { $threads = $null } else { $threads = $payload.data.repository.pullRequest.reviewThreads } } catch { $threads = $null }
               if ($null -eq $threads -or $null -eq $threads.pageInfo -or $null -eq $threads.nodes) { return @('Review threads are unreadable or malformed; the next run re-audits them') }
               foreach ($thread in @($threads.nodes)) {
                 if ($thread.isResolved -eq $false -and $thread.isOutdated -eq $false) {
